@@ -1,0 +1,9 @@
+{
+  "identifier": "default",
+  "description": "Capability for all Later windows — spotlight, popup, and library all need to invoke Rust commands.",
+  "windows": ["main", "popup", "library"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open"
+  ]
+}
