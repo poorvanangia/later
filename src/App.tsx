@@ -2,6 +2,19 @@ import { useState, useEffect } from 'react'
 import { LibraryPage } from './components/LibraryPage'
 import { SpotlightBar } from './components/SpotlightBar'
 
+const SYNC_EVENT = 'later://state-changed'
+
+// Tauri webviews share localStorage but the browser `storage` event doesn't
+// fire reliably cross-window on macOS WKWebView. We emit a Tauri event after
+// every persisted change and listen in every window so library/popup/spotlight
+// stay in sync.
+async function broadcastChange() {
+  try {
+    const { emit } = await import('@tauri-apps/api/event')
+    await emit(SYNC_EVENT)
+  } catch { }
+}
+
 const WINDOW_LABEL = (window as any).__TAURI_INTERNALS__?.metadata?.currentWindow?.label ?? ''
 const IS_SPOTLIGHT = WINDOW_LABEL === 'main'
 
@@ -9,6 +22,8 @@ const SEED_CATEGORIES = ['Articles', 'Cooking', 'Travel', 'Shopping', 'Videos', 
 const UNDO_LIMIT = 20
 
 export type ItemType = 'link' | 'note' | 'pdf'
+
+type Snapshot = { links: LinkRow[]; categories: string[] }
 
 export type LinkRow = {
   id: string
@@ -34,6 +49,7 @@ function loadLinks(): LinkRow[] {
 
 function saveLinks(links: LinkRow[]) {
   localStorage.setItem('later:links', JSON.stringify(links))
+  broadcastChange()
 }
 
 function loadCategories(): string[] {
@@ -47,6 +63,7 @@ function loadCategories(): string[] {
 
 function saveCategories(cats: string[]) {
   localStorage.setItem('later:categories', JSON.stringify(cats))
+  broadcastChange()
 }
 
 function detectType(text: string): ItemType {
@@ -60,20 +77,25 @@ export default function App() {
   const [links, setLinks] = useState<LinkRow[]>(loadLinks)
   const [search, setSearch] = useState('')
   const [categories, setCategories] = useState<string[]>(loadCategories)
-  const [, setUndoStack] = useState<LinkRow[][]>([])
+  const [, setUndoStack] = useState<Snapshot[]>([])
 
   const aiCategories = [...new Set(links.map(l => l.category).filter(Boolean) as string[])]
   const allCategories = [...new Set([...categories, ...aiCategories])]
 
   // Generic mutator — pushes the PREVIOUS state onto the undo stack, then applies the update.
   // User-initiated actions (add, edit, done, category change, delete) go through this.
+  const mutate = (updater: (prev: Snapshot) => Snapshot) => {
+    const prevSnap: Snapshot = { links, categories }
+    const next = updater(prevSnap)
+    setUndoStack(stack => [...stack.slice(-(UNDO_LIMIT - 1)), prevSnap])
+    setLinks(next.links)
+    setCategories(next.categories)
+    saveLinks(next.links)
+    saveCategories(next.categories)
+  }
+
   const mutateLinks = (updater: (prev: LinkRow[]) => LinkRow[]) => {
-    setLinks(prev => {
-      const updated = updater(prev)
-      setUndoStack(stack => [...stack.slice(-(UNDO_LIMIT - 1)), prev])
-      saveLinks(updated)
-      return updated
-    })
+    mutate(prev => ({ links: updater(prev.links), categories: prev.categories }))
   }
 
   // Background AI updates (title fetch, classification, summarisation) bypass undo —
@@ -86,30 +108,76 @@ export default function App() {
     })
   }
 
+  // Reload from localStorage on storage event (other browser tabs) OR Tauri
+  // event (other Tauri windows in this same app).
   useEffect(() => {
-    const handler = () => {
+    const reload = () => {
+      console.log('[later] sync: reloading from localStorage')
       setLinks(loadLinks())
       setCategories(loadCategories())
     }
-    window.addEventListener('storage', handler)
-    return () => window.removeEventListener('storage', handler)
+    window.addEventListener('storage', reload)
+    let unlisten: (() => void) | undefined
+    ;(async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event')
+        unlisten = await listen(SYNC_EVENT, reload)
+      } catch { }
+    })()
+    return () => {
+      window.removeEventListener('storage', reload)
+      if (unlisten) unlisten()
+    }
   }, [])
 
-  // Global Cmd+Z — undo the last user action
+  // Check for app updates once per library-window mount. Gated to the library
+  // window because the spotlight pops up many times a day — a confirm dialog
+  // there would be disruptive. If the user never opens the library, they won't
+  // see updates; that's the tradeoff for a menu-bar app where the main UI is
+  // the transient spotlight.
+  useEffect(() => {
+    if (WINDOW_LABEL !== 'library') return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const { check } = await import('@tauri-apps/plugin-updater')
+        const update = await check()
+        if (cancelled || !update) return
+        const yes = window.confirm(
+          `A new version of Later is available (${update.version}). Update now?`
+        )
+        if (!yes) return
+        await update.downloadAndInstall()
+        const { relaunch } = await import('@tauri-apps/plugin-process')
+        await relaunch()
+      } catch (e) {
+        console.warn('[later] update check failed:', e)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [])
+
+  // Global Cmd+Z — undo the last user action. Works even when an input is focused:
+  // every row in the library is an <input>, so gating on focus would mean undo
+  // essentially never fires. We pop our own stack and preventDefault so the
+  // browser's native input-undo doesn't fight us.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      const tag = (document.activeElement?.tagName || '').toLowerCase()
-      if (tag === 'input' || tag === 'textarea') return
-      if (e.metaKey && e.key.toLowerCase() === 'z') {
-        e.preventDefault()
-        setUndoStack(stack => {
-          if (stack.length === 0) return stack
-          const last = stack[stack.length - 1]
-          setLinks(last)
-          saveLinks(last)
-          return stack.slice(0, -1)
-        })
-      }
+      if (!e.metaKey || e.shiftKey) return
+      if (e.key.toLowerCase() !== 'z') return
+      console.log('[later] Cmd+Z pressed')
+      e.preventDefault()
+      setUndoStack(stack => {
+        if (stack.length === 0) {
+          console.log('[later] undo: stack empty, nothing to restore')
+          return stack
+        }
+        const last = stack[stack.length - 1]
+        console.log('[later] undo: restoring', { links: last.links.length, categories: last.categories.length })
+        setLinks(last.links); saveLinks(last.links)
+        setCategories(last.categories); saveCategories(last.categories)
+        return stack.slice(0, -1)
+      })
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
@@ -127,15 +195,25 @@ export default function App() {
   }
 
   const classifyItem = async (id: string, text: string) => {
+    console.log('[later] classifyItem start', { id, text: text.slice(0, 60) })
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      const category = await invoke<string>('classify_item', { text })
-      const finalCategory = category && category.trim().length > 0 ? category.trim() : 'Other'
-      applyBackgroundUpdate(prev => prev.map(l => l.id === id ? { ...l, category: finalCategory, ai_processed: true } : l))
-      if (!allCategories.includes(finalCategory)) handleAddCategory(finalCategory)
-    } catch {
-      // Network/API failure — still assign a category so nothing is left blank
-      applyBackgroundUpdate(prev => prev.map(l => l.id === id ? { ...l, category: 'Other', ai_processed: true } : l))
+      const raw = await invoke<string>('classify_item', { text, existingCategories: allCategories })
+      console.log('[later] classifyItem response', { id, raw })
+      const cleaned = (raw || '').trim().replace(/^["']|["']$/g, '').replace(/[.,;:!?]+$/, '').trim()
+      const generic = /^(other|misc|miscellaneous|uncategori[sz]ed|general|unknown)$/i
+      if (!cleaned || generic.test(cleaned)) {
+        // Empty response = backend silently failed (likely API error). Mark as
+        // processed but leave category null; surface as "AI failed" in UI.
+        console.warn('[later] classifyItem: empty or generic response — backend likely errored (see Rust stderr)')
+        applyBackgroundUpdate(prev => prev.map(l => l.id === id ? { ...l, ai_processed: true } : l))
+        return
+      }
+      applyBackgroundUpdate(prev => prev.map(l => l.id === id ? { ...l, category: cleaned, ai_processed: true } : l))
+      if (!allCategories.includes(cleaned)) handleAddCategory(cleaned)
+    } catch (err) {
+      console.error('[later] classifyItem invoke threw', err)
+      applyBackgroundUpdate(prev => prev.map(l => l.id === id ? { ...l, ai_processed: true } : l))
     }
   }
 
@@ -207,15 +285,75 @@ export default function App() {
   }
 
   const handleDeleteCategory = (name: string) => {
-    const updated = categories.filter(c => c !== name)
-    setCategories(updated)
-    saveCategories(updated)
-    mutateLinks(prev => prev.map(l => l.category === name ? { ...l, category: null } : l))
+    mutate(prev => ({
+      links: prev.links.map(l => l.category === name ? { ...l, category: null } : l),
+      categories: prev.categories.filter(c => c !== name),
+    }))
     if (view === `cat:${name}`) setView('library')
   }
 
   const handleDeleteItem = (id: string) => {
     mutateLinks(prev => prev.filter(l => l.id !== id))
+  }
+
+  const handleDeleteItems = (ids: string[]) => {
+    if (ids.length === 0) return
+    const set = new Set(ids)
+    mutateLinks(prev => prev.filter(l => !set.has(l.id)))
+  }
+
+  // Split an item at the cursor. `before` stays in the original row, `after`
+  // becomes a brand-new row inserted right after it. The undo snapshot stores
+  // the user's *typed* text (before + after), so Cmd+Z restores what they had
+  // on screen, not the last-committed title.
+  const handleSplitItem = (id: string, before: string, after: string, newId: string) => {
+    const original = links.find(l => l.id === id)
+    if (!original) return
+    const originalText = before + after
+    const prevSnap: Snapshot = {
+      links: links.map(l => l.id === id ? { ...l, title: originalText } : l),
+      categories,
+    }
+    const newItem: LinkRow = {
+      id: newId,
+      url: '',
+      title: after,
+      note: null,
+      category: original.category,
+      label: null,
+      read_time_minutes: null,
+      intent: null,
+      is_done: false,
+      ai_processed: !!original.category,
+      created_at: new Date().toISOString(),
+      item_type: 'note',
+    }
+    const nextLinks = links.flatMap(l => l.id === id ? [{ ...l, title: before }, newItem] : [l])
+    setUndoStack(stack => [...stack.slice(-(UNDO_LIMIT - 1)), prevSnap])
+    setLinks(nextLinks); saveLinks(nextLinks)
+  }
+
+  // Merge `fromId` into `intoId`. `intoText` and `fromText` are the live input
+  // values at the moment Backspace was pressed — used both to compute the
+  // merged result and to reconstruct the pre-merge state for undo.
+  const handleMergeItems = (intoId: string, fromId: string, intoText: string, fromText: string) => {
+    const intoLink = links.find(l => l.id === intoId)
+    const fromLink = links.find(l => l.id === fromId)
+    if (!intoLink || !fromLink) return
+    const prevSnap: Snapshot = {
+      links: links.map(l => {
+        if (l.id === intoId) return { ...l, title: intoText }
+        if (l.id === fromId) return { ...l, title: fromText }
+        return l
+      }),
+      categories,
+    }
+    const merged = intoText + fromText
+    const nextLinks = links
+      .map(l => l.id === intoId ? { ...l, title: merged } : l)
+      .filter(l => l.id !== fromId)
+    setUndoStack(stack => [...stack.slice(-(UNDO_LIMIT - 1)), prevSnap])
+    setLinks(nextLinks); saveLinks(nextLinks)
   }
 
   const handleNavigate = (newView: string) => {
@@ -242,6 +380,9 @@ export default function App() {
       onUpdateItem={handleUpdateItem}
       onAddItem={handleSave}
       onDeleteItem={handleDeleteItem}
+      onDeleteItems={handleDeleteItems}
+      onSplitItem={handleSplitItem}
+      onMergeItems={handleMergeItems}
     />
   )
 }

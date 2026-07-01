@@ -1,0 +1,170 @@
+name: Release
+
+# Fires on tag pushes matching `v*` (e.g. v0.1.1, v0.2.0). Bump version in
+# tauri.conf.json AND package.json first, then push the tag:
+#   git tag v0.1.1 && git push origin v0.1.1
+# Also supports manual dispatch for testing.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: macos-14  # Apple Silicon runner — matches our aarch64 target.
+    permissions:
+      contents: write  # Needed for gh release create.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm deps
+        run: npm ci
+
+      # Import the Developer ID cert (base64'd .p12) into a fresh ephemeral
+      # keychain — never touches the runner's default keychain, cleaned up in a
+      # final step regardless of outcome.
+      - name: Import Apple signing certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          # Add our keychain to the search list without dropping the login keychain.
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | sed -e 's/[" ]//g')
+          rm "$RUNNER_TEMP/cert.p12"
+          echo "KEYCHAIN_PATH=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      # `tauri build` with TAURI_SIGNING_PRIVATE_KEY set produces:
+      #   src-tauri/target/release/bundle/macos/Later.app     (signed via tauri.conf.json signingIdentity)
+      #   src-tauri/target/release/bundle/dmg/Later_*.dmg     (NOT signed — we sign after)
+      #   src-tauri/target/release/bundle/macos/Later.app.tar.gz + .sig  (for the updater)
+      # We intentionally do NOT set APPLE_ID/APPLE_PASSWORD here — otherwise
+      # tauri would auto-notarize before we've signed the DMG. Notarization
+      # runs as its own step below.
+      - name: Build (retry once — bundle_dmg.sh has a flaky AppleScript race)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: |
+          npm run tauri:build || (echo "First build failed; retrying..." && sleep 3 && npm run tauri:build)
+
+      - name: Locate artifacts
+        run: |
+          APP_PATH="src-tauri/target/release/bundle/macos/Later.app"
+          DMG_PATH="$(ls -t src-tauri/target/release/bundle/dmg/Later_*.dmg | head -1)"
+          TARGZ_PATH="$(ls -t src-tauri/target/release/bundle/macos/Later.app.tar.gz | head -1)"
+          SIG_PATH="$(ls -t src-tauri/target/release/bundle/macos/Later.app.tar.gz.sig | head -1)"
+          [[ -d "$APP_PATH" ]] || { echo "Missing $APP_PATH" >&2; exit 1; }
+          [[ -f "$DMG_PATH" ]] || { echo "No DMG produced" >&2; exit 1; }
+          [[ -f "$TARGZ_PATH" ]] || { echo "No updater .tar.gz produced" >&2; exit 1; }
+          [[ -f "$SIG_PATH" ]] || { echo "No updater .sig produced" >&2; exit 1; }
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+          echo "DMG_PATH=$DMG_PATH" >> "$GITHUB_ENV"
+          echo "TARGZ_PATH=$TARGZ_PATH" >> "$GITHUB_ENV"
+          echo "SIG_PATH=$SIG_PATH" >> "$GITHUB_ENV"
+
+      - name: Sign DMG
+        run: |
+          codesign --sign "Developer ID Application: Poorva Nangia (5F3CS8PL3T)" --timestamp "$DMG_PATH"
+
+      - name: Notarize DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit "$DMG_PATH" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+      - name: Staple tickets to .app and .dmg
+        run: |
+          xcrun stapler staple "$APP_PATH"
+          xcrun stapler staple "$DMG_PATH"
+
+      - name: Verify Gatekeeper acceptance
+        run: |
+          spctl --assess --verbose=4 --type execute "$APP_PATH"
+          spctl --assess --verbose=4 --type install "$DMG_PATH"
+
+      # Build the signed manifest tauri-plugin-updater fetches on launch. The
+      # signature field is the raw multi-line minisign block from .sig — using
+      # jq keeps JSON escaping correct.
+      - name: Assemble latest.json
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TARGZ_NAME="$(basename "$TARGZ_PATH")"
+          SIGNATURE="$(cat "$SIG_PATH")"
+          PUB_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          URL="https://github.com/poorvanangia/later/releases/download/${GITHUB_REF_NAME}/${TARGZ_NAME}"
+          NOTES="See release notes at https://github.com/poorvanangia/later/releases/tag/${GITHUB_REF_NAME}"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "$NOTES" \
+            --arg pub_date "$PUB_DATE" \
+            --arg signature "$SIGNATURE" \
+            --arg url "$URL" \
+            '{
+              version: $version,
+              notes: $notes,
+              pub_date: $pub_date,
+              platforms: {
+                "darwin-aarch64": {
+                  signature: $signature,
+                  url: $url
+                }
+              }
+            }' > latest.json
+          cat latest.json
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Later $VERSION" \
+            --generate-notes \
+            "$DMG_PATH" \
+            "$TARGZ_PATH" \
+            "$SIG_PATH" \
+            latest.json
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          if [[ -n "${KEYCHAIN_PATH:-}" && -f "$KEYCHAIN_PATH" ]]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi

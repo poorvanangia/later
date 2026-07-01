@@ -25,19 +25,21 @@ type Props = {
   onUpdateItem?: (id: string, updates: Partial<LinkRow>) => void
   onAddItem?: (text: string, category?: string) => void
   onDeleteItem?: (id: string) => void
+  onDeleteItems?: (ids: string[]) => void
+  onSplitItem?: (id: string, before: string, after: string, newId: string) => void
+  onMergeItems?: (intoId: string, fromId: string, intoText: string, fromText: string) => void
 }
 
 export function LibraryPage({
   links, categories, activeView, search,
   onNavigate, onAddCategory, onDone, onSearchChange, onCategoryChange,
   onDeleteCategory, onUpdateItem, onAddItem, onDeleteItem,
+  onDeleteItems, onSplitItem, onMergeItems,
 }: Props) {
   const [addingCat, setAddingCat] = useState(false)
   const [newCatName, setNewCatName] = useState('')
   const [editingCat, setEditingCat] = useState<string | null>(null)
   const [editingCatValue, setEditingCatValue] = useState('')
-  const [editingItemId, setEditingItemId] = useState<string | null>(null)
-  const [editingValue, setEditingValue] = useState('')
   const [newLineValue, setNewLineValue] = useState('')
   const [openDropdownId, setOpenDropdownId] = useState<string | null>(null)
   const [addingCatInline, setAddingCatInline] = useState(false)
@@ -46,13 +48,11 @@ export function LibraryPage({
   const [selectedItem, setSelectedItem] = useState<LinkRow | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [lastIndex, setLastIndex] = useState<number | null>(null)
+  const [edits, setEdits] = useState<Record<string, string>>({})
   const [showWelcome, setShowWelcome] = useState(() => !localStorage.getItem('later:welcomeDone'))
   const newLineRef = useRef<HTMLInputElement>(null)
-  const editRefs = useRef<Record<string, HTMLInputElement | null>>({})
+  const inputRefs = useRef<Record<string, HTMLInputElement | null>>({})
   const dropdownRef = useRef<HTMLDivElement>(null)
-  const rowRefs = useRef<Record<number, HTMLDivElement | null>>({})
-  const listContainerRef = useRef<HTMLDivElement>(null)
-  const [barTop, setBarTop] = useState<number | null>(null)
 
   const filtered = links.filter((l) => {
     const matchesView =
@@ -71,6 +71,13 @@ export function LibraryPage({
   const undone = filtered.filter(l => !l.is_done)
   const done = filtered.filter(l => l.is_done)
   const sorted = [...undone, ...done]
+
+  // Open-item counts per category, for the sidebar badges
+  const categoryCounts: Record<string, number> = {}
+  for (const link of links) {
+    if (link.is_done) continue
+    if (link.category) categoryCounts[link.category] = (categoryCounts[link.category] || 0) + 1
+  }
 
   const getPageTitle = () => {
     if (activeView === 'library') return 'All Items'
@@ -91,77 +98,141 @@ export function LibraryPage({
     return () => document.removeEventListener('mousedown', handler)
   }, [])
 
-  // Keyboard: select-all, copy, delete, escape, arrow navigation
+  // Window-level shortcuts that only apply when no input is focused.
+  // Per-row arrow-key navigation lives on each input's onKeyDown.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const tag = (document.activeElement?.tagName || '').toLowerCase()
       const isInputFocused = tag === 'input' || tag === 'textarea'
 
-      // Arrow keys always drive list navigation — even if a text input has focus,
-      // since Up/Down don't do anything useful inside a single-line input anyway.
-      if (!e.metaKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
-        if (e.key === 'ArrowDown') {
-          e.preventDefault()
-          if (sorted.length === 0) { newLineRef.current?.focus(); return }
-          if (e.shiftKey && lastIndex !== null) {
-            const ni = Math.min(lastIndex + 1, sorted.length - 1)
-            if (sorted[ni]) { setSelectedIds(p => new Set([...p, sorted[ni].id])); setLastIndex(ni) }
-          } else if (lastIndex === null) {
-            setSelectedIds(new Set([sorted[0].id])); setLastIndex(0)
-            if (isInputFocused) (document.activeElement as HTMLElement)?.blur()
-          } else if (lastIndex >= sorted.length - 1) {
-            // Already at the last item — flow forward into the new-item input
-            setSelectedIds(new Set()); setLastIndex(null)
-            newLineRef.current?.focus()
-          } else {
-            const ni = lastIndex + 1
-            setSelectedIds(new Set([sorted[ni].id])); setLastIndex(ni)
-            if (isInputFocused) (document.activeElement as HTMLElement)?.blur()
-          }
-        } else {
-          e.preventDefault()
-          if (isInputFocused) (document.activeElement as HTMLElement)?.blur()
-          if (sorted.length === 0) return
-          if (e.shiftKey && lastIndex !== null) {
-            const pi = Math.max(lastIndex - 1, 0)
-            if (sorted[pi]) { setSelectedIds(p => new Set([...p, sorted[pi].id])); setLastIndex(pi) }
-          } else if (lastIndex === null) {
-            // Coming back up from the new-item input — land on the last item
-            const ni = sorted.length - 1
-            setSelectedIds(new Set([sorted[ni].id])); setLastIndex(ni)
-          } else {
-            const pi = Math.max(lastIndex - 1, 0)
-            setSelectedIds(new Set([sorted[pi].id])); setLastIndex(pi)
-          }
-        }
-        return
-      }
-
-      // Everything below only applies when NOT typing in a text field
-      if (isInputFocused) return
-
-      // Cmd+A — select everything in the current view (Apple Notes style)
-      if (e.metaKey && e.key.toLowerCase() === 'a') {
+      // Cmd+A — select every visible item (Apple Notes style)
+      if (!isInputFocused && e.metaKey && e.key.toLowerCase() === 'a') {
         e.preventDefault()
         setSelectedIds(new Set(sorted.map(l => l.id)))
         setLastIndex(sorted.length - 1)
         return
       }
 
-      // Cmd+C — copy selected item titles to clipboard
-      if (e.metaKey && e.key.toLowerCase() === 'c' && selectedIds.size > 0) {
+      // Cmd+C — copy selected item titles
+      if (!isInputFocused && e.metaKey && e.key.toLowerCase() === 'c' && selectedIds.size > 0) {
         e.preventDefault()
         const text = sorted.filter(l => selectedIds.has(l.id)).map(l => l.title || l.url).join('\n')
         navigator.clipboard?.writeText(text).catch(() => {})
         return
       }
 
-      // Backspace/Delete — remove all selected items
-      if ((e.key === 'Backspace' || e.key === 'Delete') && selectedIds.size > 0) {
+      // Cmd+Delete / Cmd+Backspace — wipe every currently visible item.
+      // One atomic undo step; ⌘Z restores the whole list.
+      if (!isInputFocused && e.metaKey && (e.key === 'Backspace' || e.key === 'Delete')) {
+        if (sorted.length === 0) return
         e.preventDefault()
-        if (onDeleteItem) selectedIds.forEach(id => onDeleteItem(id))
+        const ids = sorted.map(l => l.id)
+        if (onDeleteItems) onDeleteItems(ids)
+        else if (onDeleteItem) ids.forEach(id => onDeleteItem(id))
         setSelectedIds(new Set())
         setLastIndex(null)
+        setTimeout(() => newLineRef.current?.focus(), 60)
+        return
+      }
+
+      // Backspace/Delete — bulk-delete the multi-selected items, then auto-focus the next survivor.
+      // Goes through onDeleteItems (atomic) so the entire batch is ONE undo step.
+      if (!isInputFocused && (e.key === 'Backspace' || e.key === 'Delete') && selectedIds.size > 0) {
+        e.preventDefault()
+        const selectedIndices = sorted.map((l, i) => selectedIds.has(l.id) ? i : -1).filter(i => i >= 0)
+        const firstIdx = selectedIndices.length > 0 ? Math.min(...selectedIndices) : 0
+        const survivors = sorted.filter(l => !selectedIds.has(l.id))
+        const nextFocusIdx = Math.min(firstIdx, survivors.length - 1)
+        const targetId = nextFocusIdx >= 0 ? survivors[nextFocusIdx]?.id : null
+        const idsToDelete = Array.from(selectedIds)
+        if (onDeleteItems) onDeleteItems(idsToDelete)
+        else if (onDeleteItem) idsToDelete.forEach(id => onDeleteItem(id))
+        setSelectedIds(new Set())
+        setLastIndex(null)
+        setTimeout(() => {
+          if (targetId) {
+            const input = inputRefs.current[targetId]
+            if (input) {
+              input.focus()
+              input.setSelectionRange(0, 0)
+            }
+          } else {
+            newLineRef.current?.focus()
+          }
+        }, 60)
+        return
+      }
+
+      // Cmd+Shift+ArrowDown/Up — extend (or initiate) the multi-select by one line.
+      // Works both from a focused input (initiates from that row) and from no-focus
+      // multi-select mode (extends from lastIndex). Mirrors Finder/Notes behaviour.
+      if (e.metaKey && e.shiftKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+        e.preventDefault()
+        const dir = e.key === 'ArrowDown' ? 1 : -1
+
+        // Figure out which row is currently focused (if any) so initiation lands on it.
+        let focusedIdx = -1
+        const activeEl = document.activeElement
+        if (activeEl) {
+          for (let i = 0; i < sorted.length; i++) {
+            if (inputRefs.current[sorted[i].id] === activeEl) { focusedIdx = i; break }
+          }
+        }
+
+        let head: number
+        let anchor: number
+        if (selectedIds.size === 0) {
+          anchor = focusedIdx >= 0 ? focusedIdx : 0
+          head = Math.max(0, Math.min(sorted.length - 1, anchor + dir))
+        } else {
+          const selIndices = sorted.map((l, i) => selectedIds.has(l.id) ? i : -1).filter(i => i >= 0)
+          const topIdx = Math.min(...selIndices)
+          const botIdx = Math.max(...selIndices)
+          const currentHead = lastIndex !== null && (lastIndex === topIdx || lastIndex === botIdx) ? lastIndex : (dir > 0 ? botIdx : topIdx)
+          anchor = currentHead === topIdx ? botIdx : topIdx
+          const nextHead = currentHead + dir
+          if (nextHead < 0 || nextHead >= sorted.length) {
+            console.log('[multi-select] extend hit edge, no-op. head:', currentHead)
+            return
+          }
+          head = nextHead
+        }
+
+        ;(document.activeElement as HTMLElement)?.blur()
+        const s = Math.min(anchor, head), en = Math.max(anchor, head)
+        const newIds = new Set(sorted.slice(s, en + 1).map(l => l.id))
+        setSelectedIds(newIds)
+        setLastIndex(head)
+        console.log('[multi-select] extend dir:', dir, 'anchor:', anchor, 'head:', head, 'size:', newIds.size)
+        return
+      }
+
+      // Plain ArrowUp/Down (no modifiers) while a multi-select is active → collapse
+      // the selection to a single line: the line above the top edge (for ↑) or below
+      // the bottom edge (for ↓). If size was already 1, just move it one line.
+      if (!isInputFocused && !e.metaKey && !e.shiftKey && !e.altKey && !e.ctrlKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown') && selectedIds.size > 0) {
+        e.preventDefault()
+        const selIndices = sorted.map((l, i) => selectedIds.has(l.id) ? i : -1).filter(i => i >= 0)
+        const topIdx = Math.min(...selIndices)
+        const botIdx = Math.max(...selIndices)
+        let targetIdx: number
+        if (selectedIds.size > 1) {
+          targetIdx = e.key === 'ArrowUp' ? topIdx - 1 : botIdx + 1
+          if (targetIdx < 0 || targetIdx >= sorted.length) {
+            targetIdx = e.key === 'ArrowUp' ? topIdx : botIdx
+          }
+        } else {
+          const only = topIdx
+          targetIdx = e.key === 'ArrowUp' ? only - 1 : only + 1
+          if (targetIdx < 0 || targetIdx >= sorted.length) {
+            console.log('[multi-select] plain arrow at list edge, no-op')
+            return
+          }
+        }
+        const newIds = new Set([sorted[targetIdx].id])
+        setSelectedIds(newIds)
+        setLastIndex(targetIdx)
+        console.log('[multi-select] collapse key:', e.key, 'targetIdx:', targetIdx, 'size:', newIds.size)
         return
       }
 
@@ -174,43 +245,199 @@ export function LibraryPage({
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [selectedIds, lastIndex, sorted, onDeleteItem])
+  }, [selectedIds, sorted, lastIndex, onDeleteItem, onDeleteItems])
 
-  // Position the sliding focus bar next to whichever row the keyboard cursor is on —
-  // only when exactly one item is the "current" cursor (not a multi-select range)
-  useEffect(() => {
-    if (selectedIds.size === 1 && lastIndex !== null) {
-      const rowEl = rowRefs.current[lastIndex]
-      if (rowEl) {
-        setBarTop(rowEl.offsetTop + rowEl.offsetHeight / 2)
+  // Move the text cursor into the input at row `idx`, preserving the source column
+  // (clamped to the target row's length). The text-editor cross-line cursor behaviour.
+  const moveCursorToItem = (idx: number, col: number) => {
+    const targetLink = sorted[idx]
+    if (!targetLink) return
+    const input = inputRefs.current[targetLink.id]
+    if (!input) return
+    input.focus()
+    const pos = Math.min(col, input.value.length)
+    input.setSelectionRange(pos, pos)
+  }
+
+  // Apple-Notes-style commit: write whatever is in the local edit buffer back to
+  // app state on blur, including empty strings. An empty row is a valid blank
+  // checklist line and only goes away when the user deletes/merges it.
+  const commitEdit = (id: string) => {
+    setEdits(prev => {
+      if (prev[id] === undefined) return prev
+      if (onUpdateItem) onUpdateItem(id, { title: prev[id] })
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+  }
+
+  const handleInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>, link: LinkRow, index: number) => {
+    // Cmd+Shift+ArrowUp/Down — multi-select. Suppress the native input behavior
+    // (which would select text from cursor to start/end of the field) and let the
+    // window-level handler do the row selection. preventDefault doesn't stop bubbling.
+    if (e.metaKey && e.shiftKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+      e.preventDefault()
+      return
+    }
+    // Override native input Cmd+A → select all *items*, not the text in this input
+    if (e.metaKey && e.key.toLowerCase() === 'a') {
+      e.preventDefault()
+      setSelectedIds(new Set(sorted.map(l => l.id)))
+      setLastIndex(sorted.length - 1)
+      e.currentTarget.blur()
+      return
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      const col = e.currentTarget.selectionStart ?? 0
+      if (index >= sorted.length - 1) {
+        const input = newLineRef.current
+        if (input) {
+          input.focus()
+          const pos = Math.min(col, input.value.length)
+          input.setSelectionRange(pos, pos)
+        }
+      } else {
+        moveCursorToItem(index + 1, col)
+      }
+      return
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      if (index === 0) return
+      const col = e.currentTarget.selectionStart ?? 0
+      moveCursorToItem(index - 1, col)
+      return
+    }
+    // ArrowLeft at position 0 (plain — no shift/meta/alt) → end of previous row
+    if (e.key === 'ArrowLeft' && !e.shiftKey && !e.metaKey && !e.altKey) {
+      const pos = e.currentTarget.selectionStart ?? 0
+      const end = e.currentTarget.selectionEnd ?? 0
+      if (pos === 0 && end === 0 && index > 0) {
+        e.preventDefault()
+        const prevLink = sorted[index - 1]
+        const input = inputRefs.current[prevLink.id]
+        if (input) {
+          input.focus()
+          const len = input.value.length
+          input.setSelectionRange(len, len)
+        }
         return
       }
     }
-    setBarTop(null)
-  }, [selectedIds, lastIndex, sorted.length])
+    // ArrowRight at the end of the line → start of next row (or "New item…" input)
+    if (e.key === 'ArrowRight' && !e.shiftKey && !e.metaKey && !e.altKey) {
+      const pos = e.currentTarget.selectionStart ?? 0
+      const end = e.currentTarget.selectionEnd ?? 0
+      const len = e.currentTarget.value.length
+      if (pos === len && end === len) {
+        e.preventDefault()
+        if (index < sorted.length - 1) {
+          const nextLink = sorted[index + 1]
+          const input = inputRefs.current[nextLink.id]
+          if (input) { input.focus(); input.setSelectionRange(0, 0) }
+        } else {
+          const input = newLineRef.current
+          if (input) { input.focus(); input.setSelectionRange(0, 0) }
+        }
+        return
+      }
+    }
+    // Enter → split this item at the cursor. Text before stays here, text after
+    // becomes a new row. Cursor lands at position 0 of the new row.
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      if (!onSplitItem) return
+      const pos = e.currentTarget.selectionStart ?? 0
+      const value = e.currentTarget.value
+      const before = value.slice(0, pos)
+      const after = value.slice(pos)
+      const newId = `link-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+      // Drop the local edit buffer so the input picks up the new committed title.
+      setEdits(p => { const n = { ...p }; delete n[link.id]; return n })
+      onSplitItem(link.id, before, after, newId)
+      setTimeout(() => {
+        const input = inputRefs.current[newId]
+        if (input) { input.focus(); input.setSelectionRange(0, 0) }
+      }, 60)
+      return
+    }
+    if (e.key === 'Escape') {
+      // Clear any active multi-selection, then just blur if nothing to clear.
+      if (selectedIds.size > 0) {
+        setSelectedIds(new Set())
+        setLastIndex(null)
+      }
+      setEdits(p => { const n = { ...p }; delete n[link.id]; return n })
+      e.currentTarget.blur()
+      return
+    }
+    // Backspace — if cursor is at position 0 with no selection, merge into the
+    // previous row. Empty rows fall into this case naturally (prev + "" = prev).
+    if (e.key === 'Backspace') {
+      const pos = e.currentTarget.selectionStart ?? 0
+      const end = e.currentTarget.selectionEnd ?? 0
+      if (pos !== end) return // let the browser delete the in-line selection
+      if (pos === 0) {
+        if (index === 0) {
+          // No previous row to merge into — nothing happens.
+          e.preventDefault()
+          return
+        }
+        if (!onMergeItems) return
+        e.preventDefault()
+        const currentValue = e.currentTarget.value
+        const prevLink = sorted[index - 1]
+        const prevInputEl = inputRefs.current[prevLink.id]
+        const prevValue = prevInputEl?.value ?? (edits[prevLink.id] ?? prevLink.title ?? '')
+        const cursorTarget = prevValue.length
+        setEdits(p => {
+          const n = { ...p }
+          delete n[link.id]
+          delete n[prevLink.id]
+          return n
+        })
+        onMergeItems(prevLink.id, link.id, prevValue, currentValue)
+        setTimeout(() => {
+          const input = inputRefs.current[prevLink.id]
+          if (input) {
+            input.focus()
+            input.setSelectionRange(cursorTarget, cursorTarget)
+          }
+        }, 60)
+        return
+      }
+      // pos > 0 → native single-character delete
+    }
+  }
 
-  const handleRowClick = (link: LinkRow, index: number, e: React.MouseEvent) => {
+  const handleRowMouseDown = (link: LinkRow, index: number, e: React.MouseEvent) => {
     if (e.metaKey) {
       e.preventDefault()
-      setSelectedIds(prev => { const n = new Set(prev); if (n.has(link.id)) n.delete(link.id); else n.add(link.id); return n })
-      setLastIndex(index); return
+      ;(document.activeElement as HTMLElement)?.blur()
+      setSelectedIds(prev => {
+        const n = new Set(prev)
+        if (n.has(link.id)) n.delete(link.id); else n.add(link.id)
+        return n
+      })
+      setLastIndex(index)
+      return
     }
     if (e.shiftKey && lastIndex !== null) {
       e.preventDefault()
+      ;(document.activeElement as HTMLElement)?.blur()
       const s = Math.min(lastIndex, index), en = Math.max(lastIndex, index)
       setSelectedIds(prev => new Set([...prev, ...sorted.slice(s, en + 1).map(l => l.id)]))
-      setLastIndex(index); return
+      setLastIndex(index)
+      return
     }
-    if (selectedIds.size > 0) { setSelectedIds(new Set()); setLastIndex(null); return }
-    if (isLongItem(link)) { setSelectedItem(link) }
-    else { setEditingItemId(link.id); setEditingValue(link.title || ''); setTimeout(() => editRefs.current[link.id]?.focus(), 50) }
-  }
-
-  const saveEdit = (id: string) => {
-    const t = editingValue.trim()
-    if (t && onUpdateItem) onUpdateItem(id, { title: t })
-    else if (!t && onDeleteItem) onDeleteItem(id)
-    setEditingItemId(null); setEditingValue('')
+    // Plain click clears any active multi-selection; the input then focuses naturally
+    // because the click on the row lands on the input element (flex:1 fills the row).
+    if (selectedIds.size > 0) {
+      setSelectedIds(new Set())
+      setLastIndex(null)
+    }
   }
 
   // New items inherit the current category if we're viewing one — AI only classifies
@@ -289,16 +516,20 @@ export function LibraryPage({
       <div style={{ padding: '4px 12px', marginBottom: 24 }}>
         <span style={{ fontSize: 18, fontWeight: 600, color: '#1a1a1a', fontFamily: "'Fraunces', serif", letterSpacing: '-0.2px' }}>Later<span style={{ color: '#a10808' }}>.</span></span>
       </div>
-      <button onClick={() => { onNavigate('library'); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 12px', fontSize: 14, marginBottom: 16, fontWeight: activeView === 'library' ? 500 : 400, color: activeView === 'library' ? '#1a1a1a' : '#888', background: activeView === 'library' ? '#eeede9' : 'none', border: 'none', borderRadius: 6, cursor: 'pointer', fontFamily: 'inherit' }}>All Items</button>
+      <button onClick={() => { onNavigate('library'); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 12px', fontSize: 14, marginBottom: 16, fontWeight: activeView === 'library' ? 600 : 400, color: '#1a1a1a', background: activeView === 'library' ? '#eeede9' : 'none', border: 'none', borderRadius: 6, cursor: 'pointer', fontFamily: 'inherit' }}>All Items</button>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 12px', marginBottom: 4 }}>
         <span style={{ fontSize: 11, fontWeight: 600, color: '#bbb', letterSpacing: '0.06em', textTransform: 'uppercase' }}>Categories</span>
         <button onClick={() => setAddingCat(true)} style={{ width: 18, height: 18, borderRadius: 4, border: '1px solid #d8d8d4', background: 'none', cursor: 'pointer', fontSize: 14, color: '#aaa', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'inherit', padding: 0 }}>+</button>
       </div>
       {categories.map((cat) => {
         const active = activeView === `cat:${cat}`
+        const count = categoryCounts[cat] || 0
         if (editingCat === cat) return (<div key={cat} style={{ padding: '2px 4px' }}><input autoFocus value={editingCatValue} onChange={e => setEditingCatValue(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') submitEditCat(); if (e.key === 'Escape') { setEditingCat(null); setEditingCatValue('') } }} onBlur={submitEditCat} style={{ width: '100%', fontSize: 14, padding: '5px 8px', border: '1px solid #c8c8c4', borderRadius: 6, outline: 'none', background: '#fff', color: '#1a1a1a', fontFamily: 'inherit' }} /></div>)
         return (<div key={cat} style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-          <button onClick={() => { onNavigate(`cat:${cat}`); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }} onDoubleClick={() => startEditCat(cat)} style={{ flex: 1, textAlign: 'left', padding: '7px 12px', fontSize: 14, fontWeight: active ? 500 : 400, color: active ? '#1a1a1a' : '#888', background: active ? '#eeede9' : 'none', border: 'none', borderRadius: 6, cursor: 'pointer', fontFamily: 'inherit' }}>{cat}</button>
+          <button onClick={() => { onNavigate(`cat:${cat}`); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }} onDoubleClick={() => startEditCat(cat)} style={{ flex: 1, textAlign: 'left', padding: '7px 12px', fontSize: 14, fontWeight: active ? 600 : 400, color: '#1a1a1a', background: active ? '#eeede9' : 'none', border: 'none', borderRadius: 6, cursor: 'pointer', fontFamily: 'inherit', display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>{cat}</span>
+            {count > 0 && <span style={{ color: '#aaa', fontWeight: 400, fontSize: 13, flexShrink: 0 }}>{count}</span>}
+          </button>
           {onDeleteCategory && <button onClick={() => onDeleteCategory(cat)} style={{ width: 20, height: 20, borderRadius: 4, border: 'none', background: 'none', cursor: 'pointer', color: '#ccc', fontSize: 14, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0, flexShrink: 0 }} onMouseEnter={e => { e.currentTarget.style.color = '#e05c5c' }} onMouseLeave={e => { e.currentTarget.style.color = '#ccc' }}>×</button>}
         </div>)
       })}
@@ -309,38 +540,69 @@ export function LibraryPage({
   const listPanel = (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
       <div style={{ flex: 1, overflowY: 'auto', padding: '48px 56px 24px' }}>
-        <h1 style={{ fontSize: 28, fontWeight: 600, color: '#1a1a1a', letterSpacing: '-0.5px', marginBottom: 12, lineHeight: 1.2 }}>{getPageTitle()}</h1>
-        {selectedIds.size > 0 ? (
-          <div style={{ fontSize: 12, color: '#888', background: '#eef2f8', border: '1px solid #dbe4f0', borderRadius: 7, padding: '6px 12px', marginBottom: 16, display: 'inline-flex', alignItems: 'center', gap: 10 }}><span>{selectedIds.size} selected</span><span style={{ color: '#bbb' }}>·</span><span style={{ color: '#aaa' }}>⌫ delete · ⌘C copy · Esc cancel</span></div>
-        ) : (
-          <div style={{ fontSize: 12, color: '#ccc', marginBottom: 16 }}>↑↓ to navigate · ⇧+↑↓ to select multiple · ⌘A select all</div>
-        )}
-        <div ref={listContainerRef} style={{ maxWidth: 640, position: 'relative' }}>
+        <h1 style={{ fontSize: 28, fontWeight: 600, color: '#1a1a1a', letterSpacing: '-0.5px', marginBottom: 24, lineHeight: 1.2 }}>{getPageTitle()}</h1>
+        <div style={{ maxWidth: 640 }}>
           {sorted.map((link, index) => {
-            const displayTitle = link.title || getDomain(link.url) || link.url
-            const isEditing = editingItemId === link.id
+            const isInSelection = selectedIds.has(link.id)
+            const hideCategoryUI = selectedIds.size > 1
             const isHovered = hoveredItemId === link.id
             const dropdownOpen = openDropdownId === link.id
             const isLong = isLongItem(link)
-            const isSelected = selectedIds.has(link.id)
-            const isMultiSelect = selectedIds.size > 1
+            const value = edits[link.id] !== undefined ? edits[link.id] : (link.title ?? '')
             return (
-              <div key={link.id} ref={el => { rowRefs.current[index] = el }} onClick={e => { if (e.metaKey || (e.shiftKey && lastIndex !== null)) handleRowClick(link, index, e) }} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '4px 8px', borderRadius: 6, background: isMultiSelect && isSelected ? '#dce7f5' : (isHovered || dropdownOpen ? '#f2f1ed' : 'transparent'), transition: 'background 0.1s', opacity: link.is_done ? 0.45 : 1, userSelect: 'none' }} onMouseEnter={() => setHoveredItemId(link.id)} onMouseLeave={() => { if (!dropdownOpen) setHoveredItemId(null) }}>
-                <button onClick={e => { if (e.metaKey || e.shiftKey) return; e.stopPropagation(); toggleDone(link) }} style={{ width: 16, height: 16, borderRadius: '50%', border: `1.5px solid ${link.is_done ? '#2d8a4e' : '#c8c8c4'}`, background: link.is_done ? '#2d8a4e' : 'transparent', flexShrink: 0, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0, transition: 'all 0.15s' }}>
+              <div
+                key={link.id}
+                onMouseDown={e => handleRowMouseDown(link, index, e)}
+                onMouseEnter={() => setHoveredItemId(link.id)}
+                onMouseLeave={() => { if (!dropdownOpen) setHoveredItemId(null) }}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  padding: '4px 8px',
+                  // Flat rectangle, no radius — adjacent selected rows merge into
+                  // one continuous warm-yellow block (Apple Notes selection style).
+                  borderRadius: isInSelection ? 0 : 6,
+                  background: isInSelection
+                    ? '#FAF3C0'
+                    : (isHovered || dropdownOpen ? '#f2f1ed' : 'transparent'),
+                  transition: 'background 0.1s',
+                  opacity: link.is_done ? 0.45 : 1,
+                }}
+              >
+                <button
+                  onMouseDown={e => e.stopPropagation()}
+                  onClick={e => { if (e.metaKey || e.shiftKey) return; e.stopPropagation(); toggleDone(link) }}
+                  style={{ width: 16, height: 16, borderRadius: '50%', border: `1.5px solid ${link.is_done ? '#2d8a4e' : '#c8c8c4'}`, background: link.is_done ? '#2d8a4e' : 'transparent', flexShrink: 0, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0, transition: 'all 0.15s' }}
+                >
                   {link.is_done && <span style={{ color: '#fff', fontSize: 9 }}>✓</span>}
                 </button>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0, position: 'relative' }}>
-                  {isEditing ? (
-                    <input ref={el => { editRefs.current[link.id] = el }} value={editingValue} onChange={e => setEditingValue(e.target.value)} onBlur={() => saveEdit(link.id)} onKeyDown={e => { if (e.key === 'Enter') { saveEdit(link.id); setTimeout(() => newLineRef.current?.focus(), 80) } if (e.key === 'Escape') { setEditingItemId(null); setEditingValue('') } if (e.key === 'Backspace' && editingValue === '' && onDeleteItem) { onDeleteItem(link.id); setEditingItemId(null) } }} style={{ fontSize: 15, color: '#1a1a1a', border: 'none', outline: 'none', background: 'transparent', fontFamily: 'inherit', padding: '3px 0', textDecoration: link.is_done ? 'line-through' : 'none', minWidth: 0, flex: 1 }} />
-                  ) : (
-                    <div onClick={e => { e.stopPropagation(); handleRowClick(link, index, e) }} style={{ fontSize: 15, color: '#1a1a1a', cursor: isLong ? 'pointer' : 'text', padding: '3px 0', lineHeight: '1.6', textDecoration: link.is_done ? 'line-through' : 'none', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'flex', alignItems: 'center', gap: 6 }}>
-                      {displayTitle}
-                      {isLong && <span style={{ fontSize: 11, color: '#bbb', flexShrink: 0 }}>↗</span>}
-                    </div>
+                  <input
+                    ref={el => { inputRefs.current[link.id] = el }}
+                    value={value}
+                    onChange={e => { const v = e.target.value; setEdits(p => ({ ...p, [link.id]: v })) }}
+                    onBlur={() => commitEdit(link.id)}
+                    onKeyDown={e => handleInputKeyDown(e, link, index)}
+                    style={{
+                      fontSize: 15, color: '#1a1a1a', border: 'none', outline: 'none',
+                      background: 'transparent', fontFamily: 'inherit', padding: '3px 0',
+                      textDecoration: link.is_done ? 'line-through' : 'none',
+                      minWidth: 0, flex: 1,
+                    }}
+                  />
+                  {isLong && (
+                    <button
+                      onMouseDown={e => e.stopPropagation()}
+                      onClick={e => { e.stopPropagation(); setSelectedItem(link) }}
+                      style={{ fontSize: 11, color: '#bbb', flexShrink: 0, background: 'none', border: 'none', cursor: 'pointer', padding: '2px 4px', fontFamily: 'inherit' }}
+                    >↗</button>
                   )}
-                  {(isHovered || dropdownOpen) && !isMultiSelect && (
+                  {(isHovered || dropdownOpen) && !hideCategoryUI && (
                     <div style={{ position: 'relative', flexShrink: 0 }}>
-                      <button onClick={e => { e.stopPropagation(); setOpenDropdownId(dropdownOpen ? null : link.id); setAddingCatInline(false); setInlineCatValue('') }} style={{ fontSize: 12, color: link.category ? '#888' : '#bbb', background: dropdownOpen ? '#e8e8e4' : '#eeede9', border: 'none', cursor: 'pointer', padding: '2px 7px', borderRadius: 4, fontFamily: 'inherit', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 3 }}>
+                      <button
+                        onMouseDown={e => e.stopPropagation()}
+                        onClick={e => { e.stopPropagation(); setOpenDropdownId(dropdownOpen ? null : link.id); setAddingCatInline(false); setInlineCatValue('') }}
+                        style={{ fontSize: 12, color: link.category ? '#888' : '#bbb', background: dropdownOpen ? '#e8e8e4' : '#eeede9', border: 'none', cursor: 'pointer', padding: '2px 7px', borderRadius: 4, fontFamily: 'inherit', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 3 }}
+                      >
                         {link.category || 'Category'}<span style={{ fontSize: 9, color: '#bbb' }}>▾</span>
                       </button>
                       {dropdownOpen && (
@@ -365,24 +627,25 @@ export function LibraryPage({
             )
           })}
 
-          {barTop !== null && (
-            <div style={{
-              position: 'absolute',
-              left: -14,
-              top: barTop,
-              width: 4,
-              height: 20,
-              borderRadius: 4,
-              background: '#a10808',
-              transform: 'translateY(-50%)',
-              transition: 'top 0.15s ease',
-              pointerEvents: 'none',
-            }} />
-          )}
-
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '4px 8px', marginTop: 4 }}>
             <div style={{ width: 16, height: 16, borderRadius: '50%', border: '1.5px solid #ddd', flexShrink: 0 }} />
-            <input ref={newLineRef} value={newLineValue} onChange={e => setNewLineValue(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') submitNewLine() }} onBlur={() => { if (newLineValue.trim()) submitNewLine() }} placeholder={activeView.startsWith('cat:') ? `New item in ${activeView.slice(4)}…` : 'New item…'} style={{ flex: 1, fontSize: 15, color: '#1a1a1a', border: 'none', outline: 'none', background: 'transparent', fontFamily: 'inherit', padding: '3px 0' }} />
+            <input
+              ref={newLineRef}
+              value={newLineValue}
+              onChange={e => setNewLineValue(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') submitNewLine()
+                else if (e.key === 'ArrowUp') {
+                  e.preventDefault()
+                  if (sorted.length === 0) return
+                  const col = e.currentTarget.selectionStart ?? 0
+                  moveCursorToItem(sorted.length - 1, col)
+                }
+              }}
+              onBlur={() => { if (newLineValue.trim()) submitNewLine() }}
+              placeholder={activeView.startsWith('cat:') ? `New item in ${activeView.slice(4)}…` : 'New item…'}
+              style={{ flex: 1, fontSize: 15, color: '#1a1a1a', border: 'none', outline: 'none', background: 'transparent', fontFamily: 'inherit', padding: '3px 0' }}
+            />
           </div>
           {sorted.length === 0 && !search && <div style={{ marginTop: 4, paddingLeft: 26 }}><span style={{ fontSize: 14, color: '#ccc' }}>{activeView.startsWith('cat:') ? `Nothing in ${activeView.slice(4)} yet — type above to add` : 'Nothing saved yet — type above to add'}</span></div>}
         </div>

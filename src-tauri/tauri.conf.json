@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
   "productName": "Later",
-  "version": "0.1.0",
-  "identifier": "com.later.app",
+  "version": "0.1.1",
+  "identifier": "com.poorvanangia.later",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:5173",
@@ -13,6 +13,14 @@
     "withGlobalTauri": true,
     "macOSPrivateApi": true,
     "windows": []
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/poorvanangia/later/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYzOTY0RkI5ODc2MzY5NDMKUldSRGFXT0h1VStXWStrd0lVcnlYZk5DMHoyY3FhcGhiV1AvYmpMMzd0ZnZSUFJPVEFYWXYzdFkK"
+    }
   },
   "bundle": {
     "active": true,
@@ -26,7 +34,10 @@
     ],
     "macOS": {
       "minimumSystemVersion": "10.15",
-      "signingIdentity": "Developer ID Application: Poorva Nangia (5F3CS8PL3T)"
+      "signingIdentity": "Developer ID Application: Poorva Nangia (5F3CS8PL3T)",
+      "dmg": {
+        "background": "dmg-background.png"
+      }
     }
   }
 }

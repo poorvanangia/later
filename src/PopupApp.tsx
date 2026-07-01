@@ -1,6 +1,15 @@
 import { useState, useEffect } from 'react'
 import { TrayPopup } from './components/TrayPopup'
 
+const SYNC_EVENT = 'later://state-changed'
+
+async function broadcastChange() {
+  try {
+    const { emit } = await import('@tauri-apps/api/event')
+    await emit(SYNC_EVENT)
+  } catch { }
+}
+
 const SEED_CATEGORIES = ['Articles', 'Cooking', 'Travel', 'Shopping', 'Videos', 'Research', 'Work', 'Health', 'Finance', 'Entertainment', 'News']
 
 export type ItemType = 'link' | 'note' | 'pdf'
@@ -32,6 +41,7 @@ function loadLinks(): LinkRow[] {
 
 function saveLinks(links: LinkRow[]) {
   localStorage.setItem('later:links', JSON.stringify(links))
+  broadcastChange()
 }
 
 function loadCategories(): string[] {
@@ -45,6 +55,7 @@ function loadCategories(): string[] {
 
 function saveCategories(cats: string[]) {
   localStorage.setItem('later:categories', JSON.stringify(cats))
+  broadcastChange()
 }
 
 function isPlainUrl(text: string): boolean {
@@ -137,14 +148,26 @@ export function PopupApp() {
   const aiCategories = [...new Set(links.map(l => l.category).filter(Boolean) as string[])]
   const allCategories = [...new Set([...categories, ...aiCategories])]
 
-  // Sync when other windows update localStorage
+  // Sync when other windows update localStorage. Storage events are flaky in
+  // Tauri WKWebView so we also listen for a Tauri event.
   useEffect(() => {
-    const handler = () => {
+    const reload = () => {
+      console.log('[later/popup] sync: reloading from localStorage')
       setLinks(loadLinks())
       setCategories(loadCategories())
     }
-    window.addEventListener('storage', handler)
-    return () => window.removeEventListener('storage', handler)
+    window.addEventListener('storage', reload)
+    let unlisten: (() => void) | undefined
+    ;(async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event')
+        unlisten = await listen(SYNC_EVENT, reload)
+      } catch { }
+    })()
+    return () => {
+      window.removeEventListener('storage', reload)
+      if (unlisten) unlisten()
+    }
   }, [])
 
   const fetchTitle = async (id: string, url: string) => {
@@ -163,20 +186,33 @@ export function PopupApp() {
   }
 
   const classifyItem = async (id: string, text: string) => {
+    console.log('[later/popup] classifyItem start', { id, text: text.slice(0, 60) })
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      const category = await invoke<string>('classify_item', { text })
-      if (category && category.length > 0) {
+      const raw = await invoke<string>('classify_item', { text, existingCategories: allCategories })
+      console.log('[later/popup] classifyItem response', { id, raw })
+      const cleaned = (raw || '').trim().replace(/^["']|["']$/g, '').replace(/[.,;:!?]+$/, '').trim()
+      const generic = /^(other|misc|miscellaneous|uncategori[sz]ed|general|unknown)$/i
+      if (!cleaned || generic.test(cleaned)) {
+        console.warn('[later/popup] classifyItem: empty/generic response — backend likely errored (see Rust stderr)')
         setLinks((prev) => {
-          const updated = prev.map((l) => l.id === id ? { ...l, category, ai_processed: true } : l)
+          const updated = prev.map((l) => l.id === id ? { ...l, ai_processed: true } : l)
           saveLinks(updated)
           return updated
         })
-        if (!allCategories.includes(category)) {
-          handleAddCategory(category)
-        }
+        return
       }
-    } catch { }
+      setLinks((prev) => {
+        const updated = prev.map((l) => l.id === id ? { ...l, category: cleaned, ai_processed: true } : l)
+        saveLinks(updated)
+        return updated
+      })
+      if (!allCategories.includes(cleaned)) {
+        handleAddCategory(cleaned)
+      }
+    } catch (err) {
+      console.error('[later/popup] classifyItem invoke threw', err)
+    }
   }
 
   const titleLongItem = async (id: string, text: string) => {

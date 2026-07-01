@@ -39,7 +39,7 @@ async fn fetch_title(url: String) -> String {
 }
 
 #[tauri::command]
-async fn classify_item(text: String) -> String {
+async fn classify_item(text: String, existing_categories: Option<Vec<String>>) -> String {
     eprintln!("[later] classify_item called, text len: {}", text.len());
     let api_key = match std::env::var("ANTHROPIC_API_KEY") {
         Ok(k) => k,
@@ -54,15 +54,37 @@ async fn classify_item(text: String) -> String {
         return String::new();
     }
 
+    let categories = existing_categories.unwrap_or_default();
+    let existing_block = if categories.is_empty() {
+        "The user has no categories yet — invent the right one.".to_string()
+    } else {
+        format!("The user's existing categories:\n{}", categories.iter().map(|c| format!("- {}", c)).collect::<Vec<_>>().join("\n"))
+    };
+
     let prompt = format!(
-        r#"You are a classifier for a save-for-later app. Given the following text, return ONLY a single category word from this list:
+        r#"You are categorising a single item in a personal save-for-later app. Pick the most precise category that fits.
 
-Articles, Cooking, Travel, Shopping, Videos, Research, Work, Health, Finance, Entertainment, News, Other
+{existing_block}
 
-Text: {}
+Rules:
+- If one of the user's existing categories fits well, return it EXACTLY as written (including any "Parent - Subcategory" formatting).
+- Otherwise invent a new category. Prefer a single word ("Cooking", "Travel"). Use "Parent - Subcategory" ONLY when the parent already exists or when the subcategory genuinely sharpens meaning — never force a subcategory.
+- NEVER reply "Other", "Misc", "Uncategorised", or anything generic. Always make a specific judgement based on intent.
+- Reply with ONLY the category name. No quotes, no punctuation, no explanation.
 
-Reply with ONLY the category name, nothing else."#,
-        text
+Examples:
+"Interview Jane Tuesday at 3pm" → Work - Hiring
+"Fill the compliance form" → Work - Ops
+"Buy suitcases" → Shopping - Travel
+"Get milk on the way home" → Shopping - Groceries
+"Council tax bill due Friday" → Finance - Bills
+"Watch Succession S3" → Entertainment
+"Recipe: miso aubergine" → Cooking
+"Article on Rust async" → Research
+
+Item: {text}"#,
+        existing_block = existing_block,
+        text = text,
     );
 
     let client = match reqwest::Client::builder()
@@ -74,7 +96,7 @@ Reply with ONLY the category name, nothing else."#,
 
     let body = serde_json::json!({
         "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 20,
+        "max_tokens": 30,
         "messages": [{"role": "user", "content": prompt}]
     });
 
@@ -272,6 +294,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![fetch_title, classify_item, generate_title, open_library, hide_spotlight])
         .setup(|app| {
             #[cfg(target_os = "macos")]

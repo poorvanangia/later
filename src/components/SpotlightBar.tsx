@@ -25,6 +25,11 @@ export function SpotlightBar({ onSave }: Props) {
 
   useEffect(() => {
     inputRef.current?.focus()
+    // React stays mounted across hide/show cycles, so refocus when the window
+    // regains focus — otherwise the next Cmd+Shift+L lands on a blurred input.
+    const onFocus = () => inputRef.current?.focus()
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
   }, [])
 
   useEffect(() => {
@@ -67,10 +72,11 @@ export function SpotlightBar({ onSave }: Props) {
     onSave(trimmed)
     setValue('')
     setSaved(true)
-    setTimeout(() => {
-      setSaved(false)
-      invoke('hide_spotlight').catch(() => {})
-    }, 700)
+    setTimeout(() => setSaved(false), 1000)
+    // Keep input focused so the user can chain more saves without re-opening.
+    // The spotlight only dismisses on Escape (handler above) or click-outside
+    // (Rust hides on Focused(false)).
+    inputRef.current?.focus()
   }
 
   return (
