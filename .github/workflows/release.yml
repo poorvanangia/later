@@ -93,9 +93,10 @@ jobs:
           echo "TARGZ_PATH=$TARGZ_PATH" >> "$GITHUB_ENV"
           echo "SIG_PATH=$SIG_PATH" >> "$GITHUB_ENV"
 
-      - name: Sign DMG
+      - name: Sign DMG (idempotent — Tauri may have already signed it)
         run: |
-          codesign --sign "Developer ID Application: Poorva Nangia (5F3CS8PL3T)" --timestamp "$DMG_PATH"
+          codesign --sign "Developer ID Application: Poorva Nangia (5F3CS8PL3T)" --timestamp --force "$DMG_PATH"
+          codesign --verify --verbose=2 "$DMG_PATH"
 
       - name: Notarize DMG
         env:

@@ -46,11 +46,12 @@ DMG_PATH="$(ls -t src-tauri/target/release/bundle/dmg/Later_*_*.dmg 2>/dev/null 
 echo "==> Verifying .app signature"
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
-# Tauri signs the .app but not the wrapper .dmg. Without this, spctl --type install
-# rejects the DMG even though the .app inside is fine. Sign before notarizing so the
-# notary covers the signed DMG.
-echo "==> Signing .dmg"
-codesign --sign "$IDENTITY" --timestamp "$DMG_PATH"
+# Tauri v2 signs the .dmg itself when signingIdentity is configured, but only
+# through the full bundle pipeline — if the pipeline crashed and we recovered
+# via bundle_dmg.sh manually, the DMG is unsigned. --force makes this idempotent.
+echo "==> Signing .dmg (idempotent)"
+codesign --sign "$IDENTITY" --timestamp --force "$DMG_PATH"
+codesign --verify --verbose=2 "$DMG_PATH"
 
 echo "==> Submitting .dmg to Apple for notarization (waits for verdict)"
 xcrun notarytool submit "$DMG_PATH" --keychain-profile "$PROFILE" --wait
