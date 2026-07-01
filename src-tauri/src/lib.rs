@@ -38,54 +38,16 @@ async fn fetch_title(url: String) -> String {
     String::new()
 }
 
+// The Cloudflare Worker holding the ANTHROPIC_API_KEY. Both constants are
+// baked into the shipped binary. The secret isn't truly secret — it's only
+// meant to stop casual scraping/abuse of the endpoint. Real limits live
+// server-side (per-IP rate limit + Anthropic monthly cap).
+const LATER_API_BASE: &str = "https://later-api.poorvanangia03.workers.dev";
+const LATER_API_KEY: &str = "c98175fec0af0ae02de9795fc7361132957c4163ceb3b403480c28dc5dc1e5b3";
+
 #[tauri::command]
 async fn classify_item(text: String, existing_categories: Option<Vec<String>>) -> String {
     eprintln!("[later] classify_item called, text len: {}", text.len());
-    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(k) => k,
-        Err(_) => {
-            eprintln!("[later] classify_item: ANTHROPIC_API_KEY not set in environment");
-            return String::new();
-        }
-    };
-
-    if api_key.is_empty() {
-        eprintln!("[later] classify_item: API key is empty");
-        return String::new();
-    }
-
-    let categories = existing_categories.unwrap_or_default();
-    let existing_block = if categories.is_empty() {
-        "The user has no categories yet — invent the right one.".to_string()
-    } else {
-        format!("The user's existing categories:\n{}", categories.iter().map(|c| format!("- {}", c)).collect::<Vec<_>>().join("\n"))
-    };
-
-    let prompt = format!(
-        r#"You are categorising a single item in a personal save-for-later app. Pick the most precise category that fits.
-
-{existing_block}
-
-Rules:
-- If one of the user's existing categories fits well, return it EXACTLY as written (including any "Parent - Subcategory" formatting).
-- Otherwise invent a new category. Prefer a single word ("Cooking", "Travel"). Use "Parent - Subcategory" ONLY when the parent already exists or when the subcategory genuinely sharpens meaning — never force a subcategory.
-- NEVER reply "Other", "Misc", "Uncategorised", or anything generic. Always make a specific judgement based on intent.
-- Reply with ONLY the category name. No quotes, no punctuation, no explanation.
-
-Examples:
-"Interview Jane Tuesday at 3pm" → Work - Hiring
-"Fill the compliance form" → Work - Ops
-"Buy suitcases" → Shopping - Travel
-"Get milk on the way home" → Shopping - Groceries
-"Council tax bill due Friday" → Finance - Bills
-"Watch Succession S3" → Entertainment
-"Recipe: miso aubergine" → Cooking
-"Article on Rust async" → Research
-
-Item: {text}"#,
-        existing_block = existing_block,
-        text = text,
-    );
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -95,15 +57,14 @@ Item: {text}"#,
     };
 
     let body = serde_json::json!({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 30,
-        "messages": [{"role": "user", "content": prompt}]
+        "text": text,
+        "existing_categories": existing_categories.unwrap_or_default(),
     });
 
+    let url = format!("{}/classify", LATER_API_BASE);
     let res = match client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
+        .post(&url)
+        .header("X-Later-Auth", LATER_API_KEY)
         .header("content-type", "application/json")
         .json(&body)
         .send()
@@ -123,11 +84,7 @@ Item: {text}"#,
         return String::new();
     }
 
-    let category = json["content"][0]["text"]
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let category = json["category"].as_str().unwrap_or("").trim().to_string();
     eprintln!("[later] classify_item → {:?}", category);
     category
 }
@@ -135,25 +92,6 @@ Item: {text}"#,
 #[tauri::command]
 async fn generate_title(text: String) -> String {
     eprintln!("[later] generate_title called, text len: {}", text.len());
-    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(k) => k,
-        Err(_) => {
-            eprintln!("[later] generate_title: ANTHROPIC_API_KEY not set in environment");
-            return String::new();
-        }
-    };
-
-    if api_key.is_empty() {
-        eprintln!("[later] generate_title: API key is empty");
-        return String::new();
-    }
-
-    let prompt = format!(
-        r#"Summarize the following note as a short title (max 10 words, no quotes, no trailing punctuation). Reply with ONLY the title.
-
-Note: {}"#,
-        text
-    );
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -162,16 +100,11 @@ Note: {}"#,
         Err(e) => { eprintln!("[later] generate_title client build failed: {}", e); return String::new(); }
     };
 
-    let body = serde_json::json!({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 40,
-        "messages": [{"role": "user", "content": prompt}]
-    });
-
+    let body = serde_json::json!({ "text": text });
+    let url = format!("{}/title", LATER_API_BASE);
     let res = match client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
+        .post(&url)
+        .header("X-Later-Auth", LATER_API_KEY)
         .header("content-type", "application/json")
         .json(&body)
         .send()
@@ -191,12 +124,7 @@ Note: {}"#,
         return String::new();
     }
 
-    let title = json["content"][0]["text"]
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .trim_matches('"')
-        .to_string();
+    let title = json["title"].as_str().unwrap_or("").trim().to_string();
     eprintln!("[later] generate_title → {:?}", title);
     title
 }

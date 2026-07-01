@@ -1,0 +1,11 @@
+name = "later-api"
+main = "src/index.ts"
+compatibility_date = "2026-01-15"
+
+# Secrets (set via `wrangler secret put ANTHROPIC_API_KEY` etc — NOT here):
+#   ANTHROPIC_API_KEY
+#   SHARED_SECRET
+
+# Observability so 500s / rate-limit hits show up in Cloudflare dashboard.
+[observability]
+enabled = true

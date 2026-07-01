@@ -58,6 +58,10 @@ export function SpotlightBar({ onSave }: Props) {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        // preventDefault stops WKWebView from ringing the system 'funk' sound
+        // on an unhandled Escape (macOS treats it as "no beep-eligible action taken").
+        e.preventDefault()
+        e.stopPropagation()
         invoke('hide_spotlight').catch(() => {})
       }
     }
