@@ -1,7 +1,7 @@
 {
   "name": "later",
   "private": true,
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,7 +11,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "release": "bash scripts/release.sh"
+    "release": "bash scripts/release.sh",
+    "beta:dmg": "node scripts/create-dmg-background.mjs && tauri build --bundles dmg"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.105.1",
