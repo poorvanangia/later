@@ -78,6 +78,11 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
         run: |
+          # Force a fresh bundle every run. rust-cache restores target/ from
+          # prior builds — Cargo won't rebuild the .app if no Rust source
+          # changed, so icon/resource updates would silently ship the previous
+          # bundle. Deleting just target/release/bundle keeps the compile cache.
+          rm -rf src-tauri/target/release/bundle
           npm run tauri:build
 
       # create-dmg writes a proper .DS_Store so the installer opens with the

@@ -32,6 +32,9 @@ export TAURI_SIGNING_PRIVATE_KEY="$(cat "$SIGNING_KEY_PATH")"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
 
 echo "==> tauri build (signs .app + emits updater archive; DMG built separately)"
+# Force a fresh bundle so icon/resource updates aren't shadowed by a prior
+# build's output that Cargo's incremental logic won't invalidate.
+rm -rf src-tauri/target/release/bundle
 npm run tauri:build
 
 APP_PATH="src-tauri/target/release/bundle/macos/Later.app"
