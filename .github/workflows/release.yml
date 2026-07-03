@@ -87,7 +87,10 @@ jobs:
       # with the pinned Developer ID.
       - name: Build .dmg via create-dmg
         run: |
-          rm -rf src-tauri/target/release/bundle/dmg
+          # Tauri no longer emits the dmg/ dir (targets=["app"]), so create-dmg
+          # needs it to exist before writing into it.
+          mkdir -p src-tauri/target/release/bundle/dmg
+          rm -f src-tauri/target/release/bundle/dmg/*.dmg
           npm run dmg:build
           VERSION="${GITHUB_REF_NAME#v}"
           DMG_SRC="$(ls -t src-tauri/target/release/bundle/dmg/*.dmg | head -1)"
