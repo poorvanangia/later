@@ -1,7 +1,7 @@
 {
   "name": "later",
   "private": true,
-  "version": "0.1.5",
+  "version": "0.1.6",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,7 +12,8 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "release": "bash scripts/release.sh",
-    "beta:dmg": "node scripts/create-dmg-background.mjs && tauri build --bundles dmg"
+    "icon:build": "node scripts/create-app-icon.mjs && tauri icon scripts/app-icon-source.png",
+    "dmg:build": "create-dmg --no-code-sign --overwrite src-tauri/target/release/bundle/macos/Later.app src-tauri/target/release/bundle/dmg"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.105.1",
@@ -31,6 +32,7 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.1",
+    "create-dmg": "^8.1.0",
     "eslint": "^10.2.1",
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.2",

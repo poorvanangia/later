@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Build, sign, notarize, and staple the Later macOS release.
 #
-# Stages: tauri build (sign + bundle .app/.dmg) — retried once if the bundler
-#         hits its known flaky AppleScript race
-#         → codesign the .dmg (Tauri only signs the .app inside)
+# Stages: tauri build (bundles .app + updater — DMG bundling disabled because
+#         bundle_dmg.sh produces DMGs without a .DS_Store in CI, so the layout
+#         defaults to Finder's ugly built-in one)
+#         → create-dmg (npm) to package .app into a properly-laid-out DMG
+#         → codesign the .dmg
 #         → xcrun notarytool submit --wait (via 'later-notary' keychain profile)
 #         → xcrun stapler staple (offline Gatekeeper)
 #
@@ -29,27 +31,28 @@ fi
 export TAURI_SIGNING_PRIVATE_KEY="$(cat "$SIGNING_KEY_PATH")"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
 
-# Tauri's bundle_dmg.sh has a known AppleScript timing bug ("Can't get disk
-# (-1728)") that pops on the first run under load. Retry once before failing.
-echo "==> tauri build (signs .app + bundles .dmg + signs updater archive)"
-if ! npm run tauri:build; then
-  echo "First build failed (likely the flaky DMG bundler). Retrying once..."
-  sleep 3
-  npm run tauri:build
-fi
+echo "==> tauri build (signs .app + emits updater archive; DMG built separately)"
+npm run tauri:build
 
 APP_PATH="src-tauri/target/release/bundle/macos/Later.app"
-DMG_PATH="$(ls -t src-tauri/target/release/bundle/dmg/Later_*_*.dmg 2>/dev/null | head -1 || true)"
+DMG_DIR="src-tauri/target/release/bundle/dmg"
 [[ -d "$APP_PATH" ]] || { echo "ERROR: $APP_PATH missing after build" >&2; exit 1; }
-[[ -n "$DMG_PATH" ]] || { echo "ERROR: no .dmg produced" >&2; exit 1; }
 
 echo "==> Verifying .app signature"
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
-# Tauri v2 signs the .dmg itself when signingIdentity is configured, but only
-# through the full bundle pipeline — if the pipeline crashed and we recovered
-# via bundle_dmg.sh manually, the DMG is unsigned. --force makes this idempotent.
-echo "==> Signing .dmg (idempotent)"
+# create-dmg produces a nicely-laid-out DMG with a real .DS_Store. We pass
+# --no-code-sign because we sign explicitly below with the pinned identity.
+echo "==> Building .dmg via create-dmg"
+mkdir -p "$DMG_DIR"
+rm -f "$DMG_DIR"/*.dmg
+npm run dmg:build
+VERSION="$(node -p "require('./package.json').version")"
+DMG_SRC="$(ls -t "$DMG_DIR"/*.dmg | head -1)"
+DMG_PATH="$DMG_DIR/Later_${VERSION}_aarch64.dmg"
+mv "$DMG_SRC" "$DMG_PATH"
+
+echo "==> Signing .dmg"
 codesign --sign "$IDENTITY" --timestamp --force "$DMG_PATH"
 codesign --verify --verbose=2 "$DMG_PATH"
 

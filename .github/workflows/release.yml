@@ -66,17 +66,32 @@ jobs:
 
       # `tauri build` with TAURI_SIGNING_PRIVATE_KEY set produces:
       #   src-tauri/target/release/bundle/macos/Later.app     (signed via tauri.conf.json signingIdentity)
-      #   src-tauri/target/release/bundle/dmg/Later_*.dmg     (NOT signed — we sign after)
       #   src-tauri/target/release/bundle/macos/Later.app.tar.gz + .sig  (for the updater)
-      # We intentionally do NOT set APPLE_ID/APPLE_PASSWORD here — otherwise
-      # tauri would auto-notarize before we've signed the DMG. Notarization
-      # runs as its own step below.
-      - name: Build (retry once — bundle_dmg.sh has a flaky AppleScript race)
+      # DMG is built in the next step with create-dmg — Tauri's bundle_dmg.sh
+      # produces DMGs without a .DS_Store in headless CI, so tauri.conf.json's
+      # dmg layout config is ignored at install time and Finder falls back to
+      # a default (wrong) layout. tauri.conf.json's bundle.targets pins this.
+      # We do NOT set APPLE_ID/APPLE_PASSWORD here — else tauri would try to
+      # notarize before the DMG exists. Notarization runs as its own step.
+      - name: Build .app + updater
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
         run: |
-          npm run tauri:build || (echo "First build failed; retrying..." && sleep 3 && npm run tauri:build)
+          npm run tauri:build
+
+      # create-dmg writes a proper .DS_Store so the installer opens with the
+      # app on the left and Applications alias on the right at a fixed window
+      # size — unlike Tauri's bundle_dmg.sh output in headless CI.
+      # --no-code-sign because we sign explicitly in the next-but-one step
+      # with the pinned Developer ID.
+      - name: Build .dmg via create-dmg
+        run: |
+          rm -rf src-tauri/target/release/bundle/dmg
+          npm run dmg:build
+          VERSION="${GITHUB_REF_NAME#v}"
+          DMG_SRC="$(ls -t src-tauri/target/release/bundle/dmg/*.dmg | head -1)"
+          mv "$DMG_SRC" "src-tauri/target/release/bundle/dmg/Later_${VERSION}_aarch64.dmg"
 
       - name: Locate artifacts
         run: |
@@ -93,7 +108,7 @@ jobs:
           echo "TARGZ_PATH=$TARGZ_PATH" >> "$GITHUB_ENV"
           echo "SIG_PATH=$SIG_PATH" >> "$GITHUB_ENV"
 
-      - name: Sign DMG (idempotent — Tauri may have already signed it)
+      - name: Sign DMG
         run: |
           codesign --sign "Developer ID Application: Poorva Nangia (5F3CS8PL3T)" --timestamp --force "$DMG_PATH"
           codesign --verify --verbose=2 "$DMG_PATH"
