@@ -1,7 +1,7 @@
 {
   "name": "later",
   "private": true,
-  "version": "0.1.6",
+  "version": "0.1.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,7 +12,6 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "release": "bash scripts/release.sh",
-    "icon:build": "node scripts/create-app-icon.mjs && tauri icon scripts/app-icon-source.png",
     "dmg:build": "create-dmg --no-code-sign --overwrite src-tauri/target/release/bundle/macos/Later.app src-tauri/target/release/bundle/dmg"
   },
   "dependencies": {
