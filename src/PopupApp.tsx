@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { TrayPopup } from './components/TrayPopup'
+import { Onboarding } from './components/Onboarding'
 
 const SYNC_EVENT = 'later://state-changed'
 
@@ -144,6 +145,9 @@ function normalizeStoredLinks(links: LinkRow[]): LinkRow[] {
 export function PopupApp() {
   const [links, setLinks] = useState<LinkRow[]>(loadLinks)
   const [categories, setCategories] = useState<string[]>(loadCategories)
+  const [showOnboarding, setShowOnboarding] = useState(() => {
+    try { return !localStorage.getItem('later:onboardingComplete') } catch { return false }
+  })
 
   const aiCategories = [...new Set(links.map(l => l.category).filter(Boolean) as string[])]
   const allCategories = [...new Set([...categories, ...aiCategories])]
@@ -298,15 +302,18 @@ export function PopupApp() {
   }
 
   return (
-    <TrayPopup
-      links={links}
-      categories={allCategories}
-      onSave={handleSave}
-      onDone={handleDone}
-      onCategoryChange={handleCategoryChange}
-      onAddCategory={handleAddCategory}
-      isSignedIn={true}
-      onSignIn={() => {}}
-    />
+    <>
+      <TrayPopup
+        links={links}
+        categories={allCategories}
+        onSave={handleSave}
+        onDone={handleDone}
+        onCategoryChange={handleCategoryChange}
+        onAddCategory={handleAddCategory}
+        isSignedIn={true}
+        onSignIn={() => {}}
+      />
+      {showOnboarding && <Onboarding onDone={() => setShowOnboarding(false)} />}
+    </>
   )
 }

@@ -1,16 +1,20 @@
 // Later — categorisation + title-generation edge endpoint.
 //
-// Two POST routes:
+// Three POST routes:
 //   /classify  → body { text, existing_categories? } → { category }
 //   /title     → body { text }                       → { title }
+//   /subscribe → body { email }                      → { ok: true }
 //
-// Both require:
+// All require:
 //   Header "X-Later-Auth: <SHARED_SECRET env var>"
-//   Rate limit: 60 requests / hour / IP (bucketed by /classify + /title combined)
+//   Rate limit: 120 requests / hour / IP (shared bucket across all routes)
 //
 // Env vars (set via `wrangler secret put`):
 //   ANTHROPIC_API_KEY  — Anthropic API key
 //   SHARED_SECRET      — Any random string; the Mac client embeds the same value
+//
+// KV bindings (see wrangler.toml):
+//   SUBSCRIBERS        — key/value store for /subscribe email captures
 //
 // Cost/abuse notes: the shared secret is discoverable in the client binary
 // (strings on the .app). It stops casual scraping, not a determined attacker.
@@ -19,6 +23,7 @@
 export interface Env {
   ANTHROPIC_API_KEY: string
   SHARED_SECRET: string
+  SUBSCRIBERS: KVNamespace
 }
 
 const CLASSIFY_PROMPT = (existingBlock: string, text: string) => `You are categorising a single item in a personal save-for-later app.
@@ -94,6 +99,7 @@ export default {
     try {
       if (url.pathname === '/classify') return await handleClassify(request, env)
       if (url.pathname === '/title') return await handleTitle(request, env)
+      if (url.pathname === '/subscribe') return await handleSubscribe(request, env)
       return json({ error: 'not found' }, 404)
     } catch (e) {
       console.error('handler threw:', e)
@@ -119,6 +125,28 @@ async function handleClassify(request: Request, env: Env): Promise<Response> {
   const looksLikeSentence = raw.length > 40 || /[.!?]/.test(raw) || /\b(i don't|i can't|i need|unable|unclear|context)\b/i.test(raw)
   const category = looksLikeSentence ? '' : raw
   return json({ category })
+}
+
+interface SubscribeBody { email?: string }
+
+async function handleSubscribe(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json().catch(() => ({}))) as SubscribeBody
+  const raw = (body.email ?? '').trim()
+  if (!raw) return json({ error: 'email required' }, 400)
+  if (raw.length > 320) return json({ error: 'email too long' }, 400)
+  const email = raw.toLowerCase()
+  // Deliberately permissive — better to accept a wonky-looking address than to
+  // reject a real one. Just enforces one @ with something on each side and a dot.
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return json({ error: 'invalid email' }, 400)
+  }
+  const record = JSON.stringify({
+    email,
+    source: 'first_launch',
+    created_at: Math.floor(Date.now() / 1000),
+  })
+  await env.SUBSCRIBERS.put(`email:${email}`, record)
+  return json({ ok: true })
 }
 
 async function handleTitle(request: Request, env: Env): Promise<Response> {

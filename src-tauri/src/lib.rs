@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager, WebviewUrl, WebviewWindowBuilder,
@@ -11,6 +12,12 @@ const POPUP_WIDTH: f64 = 400.0;
 const POPUP_HEIGHT: f64 = 520.0;
 const SPOTLIGHT_WIDTH: f64 = 620.0;
 const SPOTLIGHT_HEIGHT: f64 = 64.0;
+
+// Gates the popup blur-hide handler. Set to false during first-launch onboarding
+// so the popup stays open while the user reads it — clicking away or focus
+// bouncing during macOS accessory-mode startup would otherwise clobber the show.
+// `finalize_first_launch` flips it back to true when the user submits or skips.
+static HIDE_POPUP_ON_BLUR: AtomicBool = AtomicBool::new(true);
 
 #[tauri::command]
 async fn fetch_title(url: String) -> String {
@@ -129,6 +136,37 @@ async fn generate_title(text: String) -> String {
     title
 }
 
+#[tauri::command]
+async fn submit_email(email: String) -> Result<(), String> {
+    let email = email.trim().to_string();
+    eprintln!("[later] submit_email called, len: {}", email.len());
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("client build failed: {}", e))?;
+
+    let body = serde_json::json!({ "email": email });
+    let url = format!("{}/subscribe", LATER_API_BASE);
+    let res = client
+        .post(&url)
+        .header("X-Later-Auth", LATER_API_KEY)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {}", e))?;
+
+    let status = res.status();
+    if !status.is_success() {
+        let text = res.text().await.unwrap_or_default();
+        eprintln!("[later] submit_email HTTP {}: {}", status, text);
+        return Err(format!("server returned {}", status));
+    }
+    eprintln!("[later] submit_email → ok");
+    Ok(())
+}
+
 fn regex_find(text: &str, pattern: &str) -> Option<String> {
     let re = regex::Regex::new(pattern).ok()?;
     let caps = re.captures(text)?;
@@ -195,6 +233,56 @@ fn toggle_popup(app: &tauri::AppHandle, position: Option<(f64, f64)>) {
     }
 }
 
+fn show_popup_centered(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(POPUP_LABEL) {
+        if let Ok(Some(monitor)) = window.primary_monitor() {
+            let screen_size = monitor.size();
+            let scale = monitor.scale_factor();
+            let screen_w = screen_size.width as f64 / scale;
+            let screen_h = screen_size.height as f64 / scale;
+            let x = (screen_w - POPUP_WIDTH) / 2.0;
+            let y = (screen_h - POPUP_HEIGHT) / 2.0 - 60.0;
+            let _ = window.set_position(tauri::Position::Logical(
+                tauri::LogicalPosition::new(x, y),
+            ));
+        } else {
+            eprintln!("[later] show_popup_centered: primary_monitor failed, showing at default position");
+        }
+        let show_res = window.show();
+        let focus_res = window.set_focus();
+        eprintln!("[later] show_popup_centered: show={:?} focus={:?}", show_res.is_ok(), focus_res.is_ok());
+    } else {
+        eprintln!("[later] show_popup_centered: popup window not found");
+    }
+}
+
+fn first_launch_marker_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    match app.path().app_config_dir() {
+        Ok(d) => Some(d.join("first_launch_done")),
+        Err(e) => {
+            eprintln!("[later] app_config_dir failed: {}", e);
+            None
+        }
+    }
+}
+
+// Called from React once the user submits or skips the onboarding overlay.
+// Writes the marker (so subsequent launches skip auto-open) and re-enables
+// the blur-hide handler (so the popup dismisses normally from now on).
+#[tauri::command]
+async fn finalize_first_launch(app: tauri::AppHandle) {
+    if let Some(marker) = first_launch_marker_path(&app) {
+        if let Some(parent) = marker.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&marker, b"1") {
+            Ok(_) => eprintln!("[later] finalize_first_launch: marker written at {:?}", marker),
+            Err(e) => eprintln!("[later] finalize_first_launch: marker write failed: {}", e),
+        }
+    }
+    HIDE_POPUP_ON_BLUR.store(true, Ordering::Relaxed);
+}
+
 fn toggle_spotlight(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window(SPOTLIGHT_LABEL) {
         if window.is_visible().unwrap_or(false) {
@@ -224,7 +312,7 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, generate_title, open_library, hide_spotlight])
+        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, generate_title, open_library, hide_spotlight, submit_email, finalize_first_launch])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -269,12 +357,16 @@ pub fn run() {
                 });
             }
 
-            // Hide popup on blur
+            // Hide popup on blur — but only when HIDE_POPUP_ON_BLUR is true.
+            // During first-launch onboarding it's flipped false so the popup
+            // stays open through startup focus turbulence and user click-away.
             if let Some(w) = app.get_webview_window(POPUP_LABEL) {
                 let w2 = w.clone();
                 w.on_window_event(move |event| {
                     if let tauri::WindowEvent::Focused(false) = event {
-                        let _ = w2.hide();
+                        if HIDE_POPUP_ON_BLUR.load(Ordering::Relaxed) {
+                            let _ = w2.hide();
+                        }
                     }
                 });
             }
@@ -319,6 +411,29 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // First-launch auto-open. If the marker is missing we (a) suppress
+            // blur-hide so the popup can't be clobbered by startup focus
+            // shuffles or user click-away during onboarding, and (b) spawn a
+            // background thread that waits half a second (letting the app
+            // fully finish launching) then shows the popup centered. Marker
+            // itself is only written when React calls `finalize_first_launch`
+            // — that way a force-quit mid-onboarding leaves the flow ready to
+            // retry on the next launch.
+            let marker_present = first_launch_marker_path(&app.handle())
+                .map(|p| p.exists())
+                .unwrap_or(true);
+            if !marker_present {
+                eprintln!("[later] first-launch marker missing — will auto-open popup");
+                HIDE_POPUP_ON_BLUR.store(false, Ordering::Relaxed);
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    show_popup_centered(&handle);
+                });
+            } else {
+                eprintln!("[later] first-launch marker present — normal launch");
+            }
 
             Ok(())
         })

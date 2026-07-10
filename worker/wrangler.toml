@@ -6,6 +6,13 @@ compatibility_date = "2026-01-15"
 #   ANTHROPIC_API_KEY
 #   SHARED_SECRET
 
+# KV — email captures from /subscribe. Create the namespace once with:
+#   wrangler kv namespace create SUBSCRIBERS
+# then paste the returned id below (replace REPLACE_WITH_KV_ID).
+[[kv_namespaces]]
+binding = "SUBSCRIBERS"
+id = "bfe47773335341bab158a681a215d360"
+
 # Observability so 500s / rate-limit hits show up in Cloudflare dashboard.
 [observability]
 enabled = true
