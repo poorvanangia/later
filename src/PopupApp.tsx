@@ -11,7 +11,10 @@ async function broadcastChange() {
   } catch { }
 }
 
-const SEED_CATEGORIES = ['Articles', 'Cooking', 'Travel', 'Shopping', 'Videos', 'Research', 'Work', 'Health', 'Finance', 'Entertainment', 'News']
+// Legacy seed names from v0.1.7 and earlier — never a design goal, just
+// pre-population that leaked through onto every new install. Kept only for the
+// one-time purge in loadCategories(); do not re-seed.
+const LEGACY_SEED_CATEGORIES = ['Articles', 'Cooking', 'Travel', 'Shopping', 'Videos', 'Research', 'Work', 'Health', 'Finance', 'Entertainment', 'News']
 
 export type ItemType = 'link' | 'note' | 'pdf'
 
@@ -48,10 +51,21 @@ function saveLinks(links: LinkRow[]) {
 function loadCategories(): string[] {
   try {
     const stored = localStorage.getItem('later:categories')
-    if (stored) return JSON.parse(stored)
-    saveCategories(SEED_CATEGORIES)
-    return SEED_CATEGORIES
-  } catch { return SEED_CATEGORIES }
+    if (!stored) return []
+    let cats: string[] = JSON.parse(stored)
+    // One-time purge for users upgrading from a version that auto-seeded
+    // categories. Only drops legacy seed names that never got attached to any
+    // saved item — genuine user- or AI-added categories keep their names.
+    if (!localStorage.getItem('later:seedPurged')) {
+      const rawLinks = localStorage.getItem('later:links') ?? '[]'
+      const links: Array<{ category: string | null }> = JSON.parse(rawLinks)
+      const usedCats = new Set(links.map(l => l.category).filter(Boolean) as string[])
+      cats = cats.filter(c => !LEGACY_SEED_CATEGORIES.includes(c) || usedCats.has(c))
+      localStorage.setItem('later:categories', JSON.stringify(cats))
+      localStorage.setItem('later:seedPurged', '1')
+    }
+    return cats
+  } catch { return [] }
 }
 
 function saveCategories(cats: string[]) {
