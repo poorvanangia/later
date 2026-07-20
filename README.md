@@ -68,4 +68,4 @@ The Rust core exposes two Tauri commands — `classify_item` and `generate_title
 
 ## License
 
-MIT
+[MIT](./LICENSE)
