@@ -178,10 +178,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          # Also publish under a version-stable filename so the landing page
+          # can link to /releases/latest/download/Later.dmg permanently — no
+          # need to edit trylater.in on each release.
+          cp "$DMG_PATH" "Later.dmg"
           gh release create "$GITHUB_REF_NAME" \
             --title "Later $VERSION" \
             --generate-notes \
             "$DMG_PATH" \
+            "Later.dmg" \
             "$TARGZ_PATH" \
             "$SIG_PATH" \
             latest.json
