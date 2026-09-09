@@ -17,6 +17,9 @@ import {
 } from './lib/classifier'
 import { loadUserProfileText } from './lib/profile'
 import { scheduleReminderNative, cancelReminderNative } from './lib/reminders'
+import { startPollLoop } from './lib/gmailSync'
+import { loadOpenLoops, markAccepted, markRejected, loadGmailHistoryId, type OpenLoop } from './lib/openloops'
+import { OpenLoopsPage } from './components/OpenLoopsPage'
 
 const SYNC_EVENT = 'later://state-changed'
 
@@ -68,8 +71,29 @@ export type LinkRow = {
   // on the chip. Rejection clears this and logs the rejection.
   pending_suggestion?: PendingSuggestion | null
   // Optional one-time reminder. ISO datetime. When set, the Rust side has
-  // a tokio task waiting to fire a macOS notification at this time.
+  // a tokio task waiting to fire the reminder popup at this time.
   remind_at?: string | null
+  // Set when the popup has actually been presented on screen. Gates re-firing:
+  // once a popup was shown (even if the user ignored it and quit the app),
+  // we do NOT show it again on next launch. Cleared whenever remind_at is
+  // reset — a fresh schedule is a fresh popup.
+  fired_at?: string | null
+  // Set when the user pressed Okay or View. This is the "user actually saw
+  // this" signal; drives the acknowledged bell state and its "reminded X ago"
+  // tooltip. Cleared whenever remind_at is reset.
+  acknowledged_at?: string | null
+  // Provenance for items created from external sources (Gmail today; WhatsApp,
+  // LinkedIn later). Kept as a small discriminated union so the LinkRow
+  // itself doesn't grow a Gmail-specific set of fields — new sources just add
+  // a new `kind` variant.
+  source_ref?: LinkSourceRef | null
+}
+
+export type LinkSourceRef = {
+  kind: 'gmail'
+  thread_id: string
+  message_id: string
+  url: string     // pre-computed deep link, so the UI never needs Gmail's URL scheme
 }
 
 function loadLinks(): LinkRow[] {
@@ -120,7 +144,14 @@ export default function App() {
   const [links, setLinks] = useState<LinkRow[]>(loadLinks)
   const [search, setSearch] = useState('')
   const [categories, setCategories] = useState<string[]>(loadCategories)
+  const [openLoops, setOpenLoops] = useState<OpenLoop[]>(loadOpenLoops)
   const [, setUndoStack] = useState<Snapshot[]>([])
+  // "First-run nudge" state — persisted so it survives reloads. Semantics
+  // (matches spec): show banner only on a fresh 0→N transition; dismiss
+  // silently until count returns to 0.
+  const [nudgeDismissed, setNudgeDismissed] = useState<boolean>(() =>
+    localStorage.getItem('later:openloops_nudge_dismissed') === '1'
+  )
   // Onboarding was previously mounted in the (now-retired) popup window. Now
   // that the vault is the first thing users see, it lives here — shown as an
   // overlay when the completion marker is missing.
@@ -166,12 +197,14 @@ export default function App() {
   }, [])
 
   // Reload from localStorage on storage event (other browser tabs) OR Tauri
-  // event (other Tauri windows in this same app).
+  // event (other Tauri windows in this same app). Also pulls the open-loops
+  // queue in — it lives in the same shared localStorage and syncs the same way.
   useEffect(() => {
     const reload = () => {
       console.log('[later] sync: reloading from localStorage')
       setLinks(loadLinks())
       setCategories(loadCategories())
+      setOpenLoops(loadOpenLoops())
     }
     window.addEventListener('storage', reload)
     let unlisten: (() => void) | undefined
@@ -186,6 +219,22 @@ export default function App() {
       if (unlisten) unlisten()
     }
   }, [])
+
+  // Nudge-reset effect: whenever the open-loops count hits zero, clear the
+  // dismissed flag so the NEXT 0→N transition surfaces the banner again.
+  // (Setting on rise is done inline in the banner render — no effect needed
+  // since we always compute "should show" from count + dismissed.)
+  const openLoopsCount = openLoops.filter(l => l.status === 'open').length
+  useEffect(() => {
+    if (openLoopsCount === 0 && nudgeDismissed) {
+      setNudgeDismissed(false)
+      localStorage.removeItem('later:openloops_nudge_dismissed')
+    }
+  }, [openLoopsCount, nudgeDismissed])
+  const dismissNudge = () => {
+    setNudgeDismissed(true)
+    localStorage.setItem('later:openloops_nudge_dismissed', '1')
+  }
 
   // Check for app updates once per library-window mount. Gated to the library
   // window because the spotlight pops up many times a day — a confirm dialog
@@ -443,46 +492,55 @@ export default function App() {
     ))
   }
 
-  // Reminder handlers. Setting a new reminder for an item that already has
-  // one replaces the old (both server-side, via the Rust registry, and
-  // client-side, via the item's remind_at field). Clearing cancels the Rust
-  // task and nulls the field.
+  // Reminder handlers. Setting a new reminder replaces any prior one, and
+  // resets the fired/acknowledged flags so the fresh schedule is a fresh
+  // popup — an item the user acknowledged last week can be re-reminded
+  // tomorrow without leaking the old "quiet acknowledged" bell state.
   const handleSetReminder = (id: string, remindAtIso: string) => {
     const link = links.find(l => l.id === id)
     if (!link) return
     const title = link.title || link.note || link.url || 'Later reminder'
-    mutateLinks(prev => prev.map(l => l.id === id ? { ...l, remind_at: remindAtIso } : l))
+    mutateLinks(prev => prev.map(l => l.id === id
+      ? { ...l, remind_at: remindAtIso, fired_at: null, acknowledged_at: null }
+      : l))
     scheduleReminderNative(id, title, remindAtIso)
   }
   const handleClearReminder = (id: string) => {
-    mutateLinks(prev => prev.map(l => l.id === id ? { ...l, remind_at: null } : l))
+    mutateLinks(prev => prev.map(l => l.id === id
+      ? { ...l, remind_at: null, fired_at: null, acknowledged_at: null }
+      : l))
     cancelReminderNative(id)
   }
 
-  // On mount: reschedule every pending future reminder (covers app restarts).
-  // Also cancel any reminder attached to a done or deleted item.
+  // On mount: reschedule pending reminders (covers app restarts and OS wake).
+  // Skip anything already presented — `fired_at` is set by the popup itself
+  // when it appears (writes localStorage from the popup webview, which
+  // shares the same origin/localStorage as the library). This is the
+  // "no re-notify / no nag loop" guard from the spec.
+  //
+  // Anything past + not-yet-fired goes straight into Rust's queue; Rust
+  // sorts by remind_at internally, so multiple missed reminders present
+  // one at a time, most-overdue first, when the app comes back.
   useEffect(() => {
     if (WINDOW_LABEL !== 'library') return
-    const now = Date.now()
     for (const link of links) {
       if (!link.remind_at) continue
+      if (link.fired_at) continue  // already presented — don't re-fire
       const target = new Date(link.remind_at).getTime()
       if (isNaN(target)) continue
       const title = link.title || link.note || link.url || 'Later reminder'
       scheduleReminderNative(link.id, title, link.remind_at)
-      // If it's already in the past, the Rust side fires immediately.
-      void now // linted-quiet
     }
-    // Listen for reminder-fired events from Rust → scroll to and highlight
-    // the referenced item. We surface via a query-param-like hash so
-    // LibraryPage can react and scroll.
+    // "View" button in the popup asks Rust to open the vault and emit
+    // this event; we scroll to the referenced item via a hash marker
+    // that LibraryPage watches.
     let unlisten: (() => void) | undefined
     ;(async () => {
       try {
         const { listen } = await import('@tauri-apps/api/event')
-        unlisten = await listen<string>('later://reminder-fired', event => {
+        unlisten = await listen<string>('later://reminder-view-requested', event => {
           const id = event.payload
-          console.log('[later] reminder fired for', id)
+          console.log('[later] reminder view requested for', id)
           window.location.hash = `#item=${encodeURIComponent(id)}`
         })
       } catch { }
@@ -490,6 +548,66 @@ export default function App() {
     return () => { if (unlisten) unlisten() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Gmail poll loop — only in the library window (single owner) and only for
+  // the lifetime of that window. If the user closes and reopens the library,
+  // the loop restarts fresh; the sync cursor in localStorage means we don't
+  // re-process anything either way.
+  useEffect(() => {
+    if (WINDOW_LABEL !== 'library') return
+    const stop = startPollLoop()
+    return () => { stop() }
+  }, [])
+
+  // Accept an OpenLoop → real LinkRow. Runs through the same classifier path
+  // manual saves take, so Gmail-extracted items land in the same categories.
+  // If the OpenLoop carries a due_at, we schedule a reminder in the same
+  // motion — the reminder system doesn't care whether the item's source is
+  // the user typing or Gmail extraction.
+  const handleAcceptOpenLoop = (loop: OpenLoop) => {
+    const id = `link-${Date.now()}`
+    const newLink: LinkRow = {
+      id,
+      url: loop.summary,   // note-shaped item — no URL to fetch
+      title: loop.summary,
+      note: loop.summary,
+      category: null,
+      label: null,
+      read_time_minutes: null,
+      intent: null,
+      is_done: false,
+      ai_processed: false,
+      created_at: new Date().toISOString(),
+      item_type: 'note',
+      source_ref: {
+        kind: 'gmail',
+        thread_id: loop.source_thread_id,
+        message_id: loop.source_message_id,
+        url: loop.gmail_url,
+      },
+      remind_at: loop.due_at ?? null,
+      fired_at: null,
+      acknowledged_at: null,
+    }
+    mutateLinks(prev => [newLink, ...prev])
+    // Kick classification the same way handleSave does for note-type items.
+    setTimeout(() => classifyItem(id, loop.summary), 100)
+    // If we have a due date, wire the reminder — matches how handleSetReminder
+    // schedules for manually-set ones.
+    if (loop.due_at) {
+      scheduleReminderNative(id, loop.summary, loop.due_at)
+    }
+    markAccepted(loop.id, id)
+    setOpenLoops(loadOpenLoops())  // eager local refresh; sync event will confirm
+  }
+
+  const handleRejectOpenLoop = (loop: OpenLoop) => {
+    // Anchor the rejection to the current sync cursor so the extraction path
+    // can re-surface this thread ONLY if it gains new content past this point.
+    const historyId = loadGmailHistoryId() ?? ''
+    markRejected(loop.id, historyId)
+    setOpenLoops(loadOpenLoops())
+  }
 
   const handleRejectSuggestion = (id: string) => {
     const link = links.find(l => l.id === id)
@@ -677,6 +795,12 @@ export default function App() {
         onRejectSuggestion={handleRejectSuggestion}
         onSetReminder={handleSetReminder}
         onClearReminder={handleClearReminder}
+        openLoopsCount={openLoopsCount}
+        openLoops={openLoops}
+        onAcceptOpenLoop={handleAcceptOpenLoop}
+        onRejectOpenLoop={handleRejectOpenLoop}
+        showOpenLoopsNudge={openLoopsCount > 0 && !nudgeDismissed}
+        onDismissOpenLoopsNudge={dismissNudge}
       />
       {showOnboarding && <Onboarding onDone={() => setShowOnboarding(false)} />}
     </>

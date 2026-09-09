@@ -24,6 +24,12 @@ export interface Env {
   ANTHROPIC_API_KEY: string
   SHARED_SECRET: string
   SUBSCRIBERS: KVNamespace
+  // Gmail OAuth — set via `wrangler secret put GMAIL_CLIENT_ID` and
+  // `wrangler secret put GMAIL_CLIENT_SECRET`. Client_id is technically public
+  // (embedded in the Mac client too) but we keep it as a secret so the worker
+  // and the client can be rotated in lockstep from one place.
+  GMAIL_CLIENT_ID: string
+  GMAIL_CLIENT_SECRET: string
 }
 
 // The categorizer respects the user's taxonomy as a strict allowlist. It never
@@ -64,6 +70,40 @@ NAMING CONVENTIONS for "suggest_new":
 - Prefer plain, everyday consumer names over business or technical jargon. Examples of good names: Shopping, Home, Travel, Health, Errands, Reading, Watching, Learning, Cooking, Fitness. Examples to AVOID: Procurement, Acquisitions, Consumption, Operations, Consumables, Miscellaneous.
 - Use the singular or standard form users would say in conversation. "Shopping" not "Purchases"; "Travel" not "Trips"; "Home" not "Household Management".
 - Even if the user's other categories use jargon (e.g. "Company Ops"), don't mirror that tone for personal-life items — those get plain names.
+
+DOMAIN ROUTING — the following item types belong in dedicated buckets, NOT stretched into a nearby existing category:
+
+  SHOPPING (physical goods you buy): electronics, appliances, phones, clothes, furniture, groceries.
+    "Order a microwave" / "Buy a new phone" / "Order running shoes" → Shopping (or suggest_new Shopping)
+    "Get groceries" / "Buy milk" → Shopping - Groceries (or Shopping if no sub-cat)
+    Household-maintenance ("Fix the leaking tap", "Pay water bill") is NOT shopping — those are Home.
+
+  TRAVEL (getting somewhere, being somewhere for a trip): flights, hotels, Airbnbs, itineraries, packing lists tied to a trip, visas.
+    "Book flights to Tokyo" / "Reserve hotel in Lisbon" / "Plan Kyoto itinerary" → Travel
+    "Buy suitcases" → Shopping - Travel (if that sub-cat exists) or Shopping
+
+  HOME (household matters, bills tied to a residence): rent, council tax, utilities, repairs, cleaner.
+    "Pay council tax" / "Pay water bill" / "Fix the leaking tap" → Home
+
+  HEALTH (medical, fitness, wellness appointments and tasks): doctor visits, prescriptions, dentist, gym plans.
+    "Dentist appointment" / "Book GP" / "Refill prescription" → Health
+
+  ENTERTAINMENT (things to watch, listen to, play): shows, films, podcasts, games.
+    "Watch The Bear" / "Finish Baldur's Gate" → Entertainment
+
+  FINANCE (personal-finance obligations not tied to a residence): credit cards, subscriptions, taxes on income, loans.
+    "Pay off credit card" / "Renew Netflix" → Finance - Bills (or Finance)
+
+  WORK (professional life; when the item is clearly job-related, prefer the most specific Work sub-cat that exists):
+    Interviews, hiring → Work - Hiring
+    OKRs, planning, ops rituals → Work - Ops
+    Reading for learning → Work - Learning
+    Code review, engineering → Work - Engineering
+    Posts, launches, campaigns → Work - Marketing
+
+  PERSONAL is for family, close relationships, and personal appointments that don't fit any other bucket. It is NOT a catch-all for anything vaguely personal-life. "Call mom", "Anniversary dinner reservation" → Personal. "Order a microwave" or "Book flights to Tokyo" do NOT belong here.
+
+If none of the domain buckets above already exist as a category, use suggest_new to propose the correct one — DO NOT stretch Personal, Home, or any topically-adjacent category to fit.
 ${hasExisting ? '' : '\nNOTE: The user has no categories yet. Use "suggest_new" for real items and "none" for empty/gibberish input.'}
 
 ITEM:
@@ -165,6 +205,9 @@ export default {
       if (url.pathname === '/title') return await handleTitle(request, env)
       if (url.pathname === '/subscribe') return await handleSubscribe(request, env)
       if (url.pathname === '/parse_reminder') return await handleParseReminder(request, env)
+      if (url.pathname === '/gmail/exchange') return await handleGmailExchange(request, env)
+      if (url.pathname === '/gmail/sync') return await handleGmailSync(request, env)
+      if (url.pathname === '/extract_openloop') return await handleExtractOpenLoop(request, env)
       return json({ error: 'not found' }, 404)
     } catch (e) {
       console.error('handler threw:', e)
@@ -259,10 +302,15 @@ Invoke the record_reminder_time tool with your answer.
   return json({ parsed: dt.toISOString(), reason } as ParseReminderResult)
 }
 
-// Second-pass reclassify — runs Sonnet 4.6 with extended thinking on items
-// Haiku wasn't confident about. Same request/response contract as /classify,
-// same tool schema, same validation. The client only calls this after seeing
-// a non-`assign` first-pass verdict, so ~90% of items skip this path.
+// Second-pass reclassify — Sonnet 4.6 for items Haiku wasn't confident about.
+// Same request/response contract as /classify, same tool schema, same
+// validation. The client only calls this after seeing a non-`assign` verdict,
+// so ~90% of items skip this path.
+//
+// Prompt strategy: SHORTER than the first-pass prompt. Sonnet doesn't need
+// the full DOMAIN ROUTING rulebook that guides Haiku — it's a strong model
+// that can reason about domain fit from the item text + category list alone.
+// Cutting the prompt roughly in half shaves ~1-2s off the reasoning latency.
 async function handleReclassify(request: Request, env: Env): Promise<Response> {
   const body = (await request.json().catch(() => ({}))) as ClassifyBody
   const text = (body.text ?? '').trim()
@@ -275,31 +323,48 @@ async function handleReclassify(request: Request, env: Env): Promise<Response> {
     ? body.category_descriptions
     : {}
 
-  const existingBlock = cats.length === 0
-    ? 'USER\'S CATEGORIES: (none yet — the user hasn\'t created any categories)'
-    : `USER'S CATEGORIES (STRICT ALLOWLIST — assign/suggest_existing must return one of these EXACTLY):\n${cats.map(c => {
+  const catList = cats.length === 0
+    ? '(the user has no categories yet)'
+    : cats.map(c => {
         const d = descs[c]
         return d ? `- ${c} — ${d}` : `- ${c}`
-      }).join('\n')}`
+      }).join('\n')
 
   const pendingNames = Array.isArray(body.pending_new_names)
     ? body.pending_new_names.filter((n): n is string => typeof n === 'string' && n.length > 0)
     : []
-  const pendingBlock = pendingNames.length === 0
+  const pendingLine = pendingNames.length === 0
     ? ''
-    : `\n\nPENDING NEW-CATEGORY PROPOSALS (already suggested for earlier items, awaiting the user's confirmation): ${pendingNames.map(n => `"${n}"`).join(', ')}\nIf this item fits the same theme as one of these pending names, REUSE that exact name in \`category\` (still with decision "suggest_new"). Only invent a genuinely new name when this item's theme is distinct from all pending ones.`
+    : `\nPending new-category proposals from earlier items: ${pendingNames.map(n => `"${n}"`).join(', ')}. Reuse one of these names (with decision suggest_new) if this item fits the same theme.`
 
   const profileText = typeof body.user_profile === 'string' ? body.user_profile.trim().slice(0, 1000) : ''
-  const profileBlock = profileText.length === 0
+  const profileLine = profileText.length === 0
     ? ''
-    : `\n\nABOUT THE USER (self-described — use this to bias interpretation of ambiguous items):\n${profileText}\nThis context is a PRIOR, not a constraint: it should tilt close calls (e.g. "meeting with Tom" → Hiring for a founder-recruiter, Personal for a therapist) but should never override an item that clearly fits an existing category.`
+    : `\nAbout the user (for tilting close calls, not overriding clear fits): ${profileText}`
 
-  const prompt = CLASSIFY_PROMPT(existingBlock + pendingBlock + profileBlock, cats.length > 0, text)
+  const prompt = RECLASSIFY_PROMPT(catList, pendingLine, profileLine, text)
   const toolResult = await callAnthropicReasoning(env.ANTHROPIC_API_KEY, prompt, CLASSIFY_TOOL)
 
   const validated = validateClassify(toolResult, cats)
   return json(validated)
 }
+
+const RECLASSIFY_PROMPT = (catList: string, pendingLine: string, profileLine: string, text: string) => `You are Later's second-pass categorizer. The first pass (Haiku) was unsure. Decide again with more care.
+
+USER'S CATEGORIES (STRICT ALLOWLIST — assign/suggest_existing must return one of these EXACTLY):
+${catList}
+${pendingLine}${profileLine}
+
+DECIDE (in strict priority order):
+1. "assign" — highly confident (≥90%) this belongs in one of the existing categories above. Category name MUST be verbatim from the list.
+2. "suggest_existing" — an existing category is plausible but not obvious. Pick the closest name verbatim.
+3. "suggest_new" — no existing category fits. Propose a new plain, everyday name (1-3 words, Title Case: "Shopping", "Travel", "Health") + a one-sentence description. NEVER stretch Personal / Home / Work to fit a domain that doesn't match — buying goods → Shopping, trips/flights → Travel, medical → Health.
+4. "none" — no semantic content (empty, gibberish).
+
+If a category has a description, the description is authoritative — the category only fits items that match the description, not the name's loose reading.
+
+ITEM: ${text}
+`
 
 async function handleClassify(request: Request, env: Env): Promise<Response> {
   const body = (await request.json().catch(() => ({}))) as ClassifyBody
@@ -576,6 +641,490 @@ function json(body: unknown, status = 200, extraHeaders: Record<string, string> 
       ...extraHeaders,
     },
   })
+}
+
+// ---------- Gmail OAuth exchange ----------
+//
+// Client (Mac app) generates a PKCE verifier + challenge, opens the browser
+// to Google's authorize URL with redirect_uri=http://127.0.0.1:PORT, catches
+// the code on a local loopback listener, and POSTs {code, code_verifier,
+// redirect_uri} to us. We swap that for tokens using our client_secret and
+// return refresh_token + access_token + the user's email (parsed from the
+// id_token so we don't need a second /userinfo call).
+//
+// The client_secret NEVER leaves this worker. The client only sees refresh
+// and access tokens.
+async function handleGmailExchange(request: Request, env: Env): Promise<Response> {
+  if (!env.GMAIL_CLIENT_ID || !env.GMAIL_CLIENT_SECRET) {
+    return json({ error: 'gmail_not_configured', detail: 'GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET not set on the worker' }, 500)
+  }
+  let body: { code?: string; code_verifier?: string; redirect_uri?: string }
+  try { body = await request.json() as typeof body } catch { return json({ error: 'bad_json' }, 400) }
+  const { code, code_verifier, redirect_uri } = body
+  if (!code || !code_verifier || !redirect_uri) {
+    return json({ error: 'missing_fields', required: ['code', 'code_verifier', 'redirect_uri'] }, 400)
+  }
+
+  const params = new URLSearchParams({
+    code,
+    code_verifier,
+    client_id: env.GMAIL_CLIENT_ID,
+    client_secret: env.GMAIL_CLIENT_SECRET,
+    redirect_uri,
+    grant_type: 'authorization_code',
+  })
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: params.toString(),
+  })
+
+  if (!res.ok) {
+    const text = await res.text()
+    console.error('[gmail/exchange] Google returned', res.status, text)
+    // Forward Google's error verbatim so the client can display something
+    // useful (redirect_uri mismatch, invalid_grant, etc.)
+    return json({ error: 'google_token_error', status: res.status, detail: text }, 502)
+  }
+
+  const tokens = await res.json() as {
+    access_token?: string
+    refresh_token?: string
+    expires_in?: number
+    id_token?: string
+    token_type?: string
+    scope?: string
+  }
+  if (!tokens.refresh_token || !tokens.access_token) {
+    // Google withholds refresh_token when the user has already granted this
+    // app offline access before. We include prompt=consent in the auth URL to
+    // force it, so this is a real error rather than a race.
+    return json({ error: 'no_refresh_token', detail: 'Google did not issue a refresh_token — ensure prompt=consent and access_type=offline are set in the auth URL, and revoke the app in Google Account settings before retrying' }, 500)
+  }
+
+  const email = tokens.id_token ? decodeJwtEmail(tokens.id_token) : null
+  return json({
+    refresh_token: tokens.refresh_token,
+    access_token: tokens.access_token,
+    expires_in: tokens.expires_in ?? 3600,
+    email,
+    scope: tokens.scope ?? null,
+  })
+}
+
+// ---------- Gmail sync (incremental via historyId, or initial via inbox scan) ----------
+
+interface GmailSyncBody {
+  refresh_token?: string
+  since_history_id?: string
+  // Cap on how many messages to pull in the initial (no history_id) fetch, so
+  // a busy inbox doesn't produce dozens of OpenLoops on first connect. We
+  // pick the most recent N. Ignored when incremental.
+  initial_limit?: number
+}
+
+interface SyncedMessage {
+  message_id: string
+  thread_id: string
+  subject: string
+  from_name: string
+  from_email: string
+  snippet: string
+  // Decoded text body (plain-text preferred, HTML stripped as fallback).
+  // Truncated to BODY_MAX_CHARS. This is what the extractor primarily reads —
+  // Gmail's `snippet` is unreliable for self-sent or signature-heavy mail.
+  body: string
+  internal_date_ms: number
+}
+
+// Cap on how much decoded body we ship into the LLM prompt. 2000 chars is
+// ~500 tokens, plenty to include the actual ask + surrounding context without
+// blowing the max_tokens budget when we batch 25 messages.
+const BODY_MAX_CHARS = 2000
+
+async function handleGmailSync(request: Request, env: Env): Promise<Response> {
+  if (!env.GMAIL_CLIENT_ID || !env.GMAIL_CLIENT_SECRET) {
+    return json({ error: 'gmail_not_configured' }, 500)
+  }
+  let body: GmailSyncBody
+  try { body = await request.json() as GmailSyncBody } catch { return json({ error: 'bad_json' }, 400) }
+  const { refresh_token, since_history_id } = body
+  const initial_limit = Math.min(Math.max(body.initial_limit ?? 15, 1), 50)
+  if (!refresh_token) return json({ error: 'missing_refresh_token' }, 400)
+
+  const access = await refreshAccessToken(env, refresh_token)
+  if (!access.ok) return json({ error: 'refresh_failed', detail: access.detail }, 502)
+
+  // Fetch strategy: history if we have a cursor, otherwise a bounded initial scan.
+  // On history 404 (cursor too old), we fall back to initial scan silently.
+  let messageIds: string[] = []
+  let newHistoryId: string | null = null
+
+  if (since_history_id) {
+    const hist = await gmailGET(access.token, `/users/me/history?startHistoryId=${encodeURIComponent(since_history_id)}&historyTypes=messageAdded`)
+    if (hist.status === 404) {
+      // Cursor expired — fall through to initial fetch.
+    } else if (!hist.ok) {
+      return json({ error: 'gmail_history_failed', status: hist.status, detail: hist.text }, 502)
+    } else {
+      const parsed = JSON.parse(hist.text) as {
+        history?: Array<{ messagesAdded?: Array<{ message?: { id?: string; threadId?: string } }> }>
+        historyId?: string
+      }
+      const seen = new Set<string>()
+      for (const h of parsed.history ?? []) {
+        for (const ma of h.messagesAdded ?? []) {
+          if (ma.message?.id && !seen.has(ma.message.id)) {
+            seen.add(ma.message.id)
+            messageIds.push(ma.message.id)
+          }
+        }
+      }
+      newHistoryId = parsed.historyId ?? since_history_id
+    }
+  }
+
+  if (!since_history_id || newHistoryId === null) {
+    // Initial fetch: bounded scan of recent inbox messages, plus capture the
+    // current historyId as the future incremental cursor.
+    const profile = await gmailGET(access.token, '/users/me/profile')
+    if (!profile.ok) return json({ error: 'gmail_profile_failed', status: profile.status, detail: profile.text }, 502)
+    const profileParsed = JSON.parse(profile.text) as { historyId?: string; emailAddress?: string }
+    newHistoryId = profileParsed.historyId ?? null
+
+    const listRes = await gmailGET(access.token, `/users/me/messages?maxResults=${initial_limit}&q=in%3Ainbox`)
+    if (!listRes.ok) return json({ error: 'gmail_list_failed', status: listRes.status, detail: listRes.text }, 502)
+    const parsed = JSON.parse(listRes.text) as { messages?: Array<{ id?: string }> }
+    for (const m of parsed.messages ?? []) {
+      if (m.id) messageIds.push(m.id)
+    }
+  }
+
+  // Fetch full message for each — we need the body, not just the snippet.
+  // Gmail's snippet is auto-generated and unreliable for short or
+  // signature-heavy mail (it can pick the signature over the actual body).
+  // format=full returns headers + payload; we decode the plain-text part
+  // (or fall back to stripped HTML) below. Sequential rather than parallel —
+  // Workers has subrequest limits.
+  const messages: SyncedMessage[] = []
+  for (const id of messageIds) {
+    const meta = await gmailGET(
+      access.token,
+      `/users/me/messages/${encodeURIComponent(id)}?format=full`,
+    )
+    if (!meta.ok) continue
+    const parsed = JSON.parse(meta.text) as {
+      id?: string
+      threadId?: string
+      snippet?: string
+      internalDate?: string
+      payload?: GmailPayload
+    }
+    const headers = parsed.payload?.headers ?? []
+    const h = (name: string) => headers.find(x => x.name?.toLowerCase() === name.toLowerCase())?.value ?? ''
+    const from = parseFromHeader(h('From'))
+    const body = parsed.payload ? extractPlainText(parsed.payload).slice(0, BODY_MAX_CHARS) : ''
+    messages.push({
+      message_id: parsed.id ?? id,
+      thread_id: parsed.threadId ?? '',
+      subject: h('Subject'),
+      from_name: from.name,
+      from_email: from.email,
+      snippet: parsed.snippet ?? '',
+      body,
+      internal_date_ms: Number(parsed.internalDate ?? 0),
+    })
+  }
+
+  return json({ messages, new_history_id: newHistoryId })
+}
+
+// Gmail's message payload — recursive. Simple emails have body.data at the
+// top; multipart has a `parts` tree where the actual text lives one or more
+// levels down.
+interface GmailPayload {
+  mimeType?: string
+  headers?: Array<{ name?: string; value?: string }>
+  body?: { data?: string }
+  parts?: GmailPayload[]
+}
+
+// Walk the payload tree, prefer text/plain, fall back to text/html with tag
+// stripping. Returns empty string if nothing decodable is found — the
+// extractor then falls back to snippet.
+function extractPlainText(payload: GmailPayload): string {
+  // Simple single-part message.
+  if (payload.body?.data && payload.mimeType?.startsWith('text/')) {
+    const decoded = decodeGmailBody(payload.body.data)
+    return payload.mimeType === 'text/html' ? stripHtml(decoded) : decoded
+  }
+  // Multipart: gather all leaves that have body.data.
+  const leaves: GmailPayload[] = []
+  const walk = (p: GmailPayload) => {
+    if (p.parts && p.parts.length) p.parts.forEach(walk)
+    else if (p.body?.data) leaves.push(p)
+  }
+  walk(payload)
+  const textPart = leaves.find(p => p.mimeType === 'text/plain')
+  if (textPart?.body?.data) return decodeGmailBody(textPart.body.data)
+  const htmlPart = leaves.find(p => p.mimeType === 'text/html')
+  if (htmlPart?.body?.data) return stripHtml(decodeGmailBody(htmlPart.body.data))
+  return ''
+}
+
+// Gmail returns bodies base64url-encoded. atob only handles standard base64;
+// swap the URL-safe alphabet back first, then decode UTF-8 via TextDecoder
+// (atob alone would give us latin-1, mangling non-ASCII).
+function decodeGmailBody(data: string): string {
+  try {
+    const std = data.replace(/-/g, '+').replace(/_/g, '/')
+    const pad = std.length % 4 === 0 ? '' : '='.repeat(4 - (std.length % 4))
+    const bytes = Uint8Array.from(atob(std + pad), c => c.charCodeAt(0))
+    return new TextDecoder('utf-8').decode(bytes)
+  } catch (e) {
+    console.error('[gmail/sync] body decode failed', e)
+    return ''
+  }
+}
+
+// Cheap HTML → plain text. Strips tags, decodes a small set of common
+// entities, collapses whitespace. Not a full parser — good enough for the
+// extractor to see the actual text content.
+function stripHtml(html: string): string {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+// "Alice <alice@x.com>" → { name: "Alice", email: "alice@x.com" }.
+// Bare "alice@x.com" → { name: "", email: "alice@x.com" }.
+function parseFromHeader(raw: string): { name: string; email: string } {
+  const m = raw.match(/^\s*(?:"?([^"<]*?)"?\s*)?<([^>]+)>\s*$/)
+  if (m) return { name: (m[1] ?? '').trim().replace(/^"|"$/g, ''), email: m[2].trim() }
+  return { name: '', email: raw.trim() }
+}
+
+async function refreshAccessToken(env: Env, refresh_token: string): Promise<{ ok: true; token: string } | { ok: false; detail: string }> {
+  const params = new URLSearchParams({
+    client_id: env.GMAIL_CLIENT_ID,
+    client_secret: env.GMAIL_CLIENT_SECRET,
+    refresh_token,
+    grant_type: 'refresh_token',
+  })
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: params.toString(),
+  })
+  if (!res.ok) return { ok: false, detail: `${res.status}: ${await res.text()}` }
+  const j = await res.json() as { access_token?: string }
+  if (!j.access_token) return { ok: false, detail: 'no access_token in response' }
+  return { ok: true, token: j.access_token }
+}
+
+async function gmailGET(accessToken: string, path: string): Promise<{ ok: boolean; status: number; text: string }> {
+  const res = await fetch(`https://gmail.googleapis.com/gmail/v1${path}`, {
+    headers: { authorization: `Bearer ${accessToken}` },
+  })
+  const text = await res.text()
+  return { ok: res.ok, status: res.status, text }
+}
+
+// ---------- OpenLoop extraction ----------
+//
+// Batched LLM extraction. Client sends N messages, we return N verdicts
+// (some 'skip', some 'extract' with the OpenLoop fields). Precision >
+// recall by design — the prompt is written to skip anything that isn't
+// clearly actionable, since the user reviews each result manually.
+
+const EXTRACT_TOOL = {
+  name: 'record_extractions',
+  description: 'Record one verdict per email in the input batch. Include index (0-based) from the input list.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      extractions: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            index: { type: 'integer', description: '0-based index into the input email list.' },
+            decision: { type: 'string', enum: ['extract', 'skip'], description: 'extract = this email is a real open loop; skip = not actionable.' },
+            type: { type: 'string', enum: ['promise', 'pending', 'bill', 'event', ''], description: 'For extract only. promise = user committed to something (usually in a sent thread). pending = someone is waiting on the user. bill = payment / invoice / renewal with a specific ask. event = time-bound appointment/meeting the user needs to attend (interview invite, scheduled call, calendar reminder). Empty for skip.' },
+            summary: { type: 'string', description: 'For extract only: one-line task-shaped summary. NOT a copy of the subject. Present tense. Example: "Sent Priya the onboarding deck by Friday". Empty for skip.' },
+            quoted_clause: { type: 'string', description: 'For extract only: the real sentence from the email that contains the specific fact (date, amount, ask). Must be a VERBATIM copy from the snippet. Empty string if no such sentence exists — do not fabricate. Empty for skip.' },
+            due_at: { type: 'string', description: 'For extract only: ISO 8601 datetime if a specific date/time is stated or clearly implied ("by Friday", "before EOD Sept 15"). Empty string if no clear due date. Empty for skip.' },
+            skip_reason: { type: 'string', description: 'For skip only: short phrase (max 8 words). e.g. "newsletter", "receipt only", "no ask", "already-done confirmation".' },
+          },
+          required: ['index', 'decision', 'type', 'summary', 'quoted_clause', 'due_at', 'skip_reason'],
+        },
+      },
+    },
+    required: ['extractions'],
+  },
+} as const
+
+interface ExtractBody {
+  messages?: Array<{
+    message_id: string
+    thread_id: string
+    subject: string
+    from_name: string
+    from_email: string
+    snippet: string
+    body?: string
+    internal_date_ms: number
+  }>
+  user_profile?: string
+  user_email?: string
+  now_iso?: string
+}
+
+async function handleExtractOpenLoop(request: Request, env: Env): Promise<Response> {
+  let body: ExtractBody
+  try { body = await request.json() as ExtractBody } catch { return json({ error: 'bad_json' }, 400) }
+  const messages = body.messages ?? []
+  if (!messages.length) return json({ extractions: [] })
+  // Guard against oversized batches — Anthropic still succeeds but latency
+  // climbs and the tool-call JSON gets truncated. 25 is comfortable at
+  // max_tokens=4096.
+  const batch = messages.slice(0, 25)
+
+  // Log the exact input the LLM will see so `wrangler tail` gives us a
+  // reproducible view when extraction quality misfires. Kept lightweight —
+  // one line per message with a body preview.
+  console.log('[extract_openloop] user_email:', body.user_email ?? '(none)')
+  for (let i = 0; i < batch.length; i++) {
+    const m = batch[i]
+    const bodyPreview = (m.body ?? '').slice(0, 200).replace(/\n/g, ' ')
+    console.log(`[extract_openloop] msg[${i}] from="${m.from_name} <${m.from_email}>" subject="${m.subject}" body_len=${(m.body ?? '').length} body_preview="${bodyPreview}"`)
+  }
+
+  const promptBody = batch.map((m, i) => {
+    // Prefer body; snippet as fallback if body is empty (e.g. attachment-only
+    // messages where our text extraction returned nothing).
+    const content = (m.body && m.body.trim()) ? m.body : (m.snippet || '(no body)')
+    return `[${i}] From: ${m.from_name || '(no name)'} <${m.from_email}>
+Subject: ${m.subject}
+Body:
+${content}`
+  }).join('\n\n---\n\n')
+
+  const prompt = EXTRACT_PROMPT(
+    body.user_profile ?? '',
+    body.user_email ?? '',
+    body.now_iso ?? new Date().toISOString(),
+    promptBody,
+  )
+
+  const res = await fetch(ANTHROPIC_URL, {
+    method: 'POST',
+    headers: {
+      'x-api-key': env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 4096,
+      temperature: 0,
+      tools: [EXTRACT_TOOL],
+      tool_choice: { type: 'tool', name: EXTRACT_TOOL.name },
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '<no body>')
+    console.error(`[extract_openloop] anthropic ${res.status}: ${text}`)
+    return json({ error: 'anthropic_error', status: res.status }, 502)
+  }
+  const j = await res.json() as { content?: Array<{ type?: string; name?: string; input?: unknown }> }
+  const toolUse = j.content?.find(c => c.type === 'tool_use' && c.name === EXTRACT_TOOL.name)
+  if (!toolUse || typeof toolUse.input !== 'object' || toolUse.input === null) {
+    console.error('[extract_openloop] no tool_use block:', JSON.stringify(j))
+    return json({ extractions: [] })
+  }
+  const parsed = (toolUse.input as { extractions?: unknown[] }).extractions ?? []
+  // Mirror the input log with a per-message verdict — same index so it's
+  // easy to line up input vs decision in the tail output.
+  for (const p of parsed as Array<Record<string, unknown>>) {
+    console.log(`[extract_openloop] verdict[${p.index}] decision=${p.decision} type=${p.type ?? ''} skip_reason="${p.skip_reason ?? ''}" summary="${p.summary ?? ''}"`)
+  }
+  return json({ extractions: parsed })
+}
+
+const EXTRACT_PROMPT = (userProfile: string, userEmail: string, nowIso: string, emails: string) => `You are Later's Gmail extractor. Find "open loops" — items in the user's inbox that are actual commitments they need to act on. You will be given a batch of emails; return ONE verdict per email in the batch.
+
+CURRENT TIME: ${nowIso}
+USER EMAIL: ${userEmail || '(not provided)'}
+${userProfile ? `ABOUT THE USER (for classifier context, not for extraction):\n${userProfile}\n` : ''}
+
+TYPES (pick one when you extract):
+  promise — the USER committed to doing something. Rare in inbox; more common when someone replies "great, will do" back to a user's own reply. Only mark if the snippet clearly shows the user's own commitment being echoed.
+  pending — someone is waiting on the USER. An ask, a question requiring action, a review request, a "let me know", a follow-up.
+  bill    — a bill, invoice, payment reminder, subscription renewal, or an action-required transactional email with a specific ask ("your payment is due", "renewal on X", "action required to keep service").
+  event   — a time-bound appointment or meeting the user needs to ATTEND. Interview invites, scheduled calls, calendar reminders, webinar RSVPs the user already accepted. The key signal is a specific date/time the user needs to be present for, not an action they owe someone. If it's an invitation the user hasn't accepted yet and needs to respond to, that is "pending" (owes a reply), not "event".
+            For events, due_at is the ACTUAL event start time (not "act by X"), quoted_clause is the sentence naming that date/time, and summary reads as an event, e.g. "Interview with MetaVoice tomorrow at 2pm" — NOT "Reply to MetaVoice about the interview".
+
+SELF-ADDRESSED EMAILS (from_email == USER_EMAIL):
+  Treat as a note-to-self. Classify by the CONTENT of the snippet, ignoring the fact that the sender is the user:
+    - Snippet phrased as a task or question the user is posing to themselves ("can you send me the deck by Friday?", "remember to X", "need to do Y") → pending.
+    - Snippet describing a commitment the user has made elsewhere and is recording ("told Alex I'd send the report Mon") → promise.
+    - Snippet noting a bill, payment, or renewal → bill.
+    - Idle notes or references with no concrete ask → skip with reason "self-note, no ask".
+  Do NOT skip a self-addressed email just because it comes from the user — the content is what matters.
+
+SKIP these — do NOT create an OpenLoop:
+  - Marketing, newsletters, sales pitches
+  - Notifications with no ask (order shipped, package delivered, comment reply, RSVP already recorded, receipts of completed actions)
+  - Automated confirmations of things the user already did
+  - Digest / weekly summary emails
+  - Social-network notifications (LinkedIn "someone viewed your profile", Twitter mentions, etc)
+  - Generic no-reply / mailing-list emails without a personal ask
+  - Anything ambiguous. Precision matters more than recall.
+
+For EACH extraction:
+  summary       — one-line task form, NOT the subject verbatim. Present tense action.
+                  GOOD: "Reply to Sam about the pricing deck", "Pay AWS invoice ($287) by Sept 22"
+                  BAD : "Re: pricing deck", "AWS invoice"
+  quoted_clause — a REAL sentence copied VERBATIM from the snippet, containing the specific fact (date, amount, or ask). If no such sentence exists, return empty string. NEVER invent a placeholder like "…X…".
+  due_at        — ISO 8601 with offset (e.g. "2026-09-15T17:00:00-07:00") if a date or clear implication is present. Empty string if not.
+  type          — promise | pending | bill
+
+For each SKIP: brief skip_reason (max 8 words).
+
+Return via record_extractions with one entry per input email, indexed 0..N-1.
+
+EMAILS:
+${emails}`
+
+// Decode the middle segment of a Google id_token (a JWT) and pull out the
+// `email` claim. We do NOT verify the signature here — Google just handed
+// this token to us over HTTPS in the token response, so origin is guaranteed
+// by transport. Verifying the RSA signature would require pulling their
+// JWKS; skip it since we're not using the token as a security assertion.
+function decodeJwtEmail(idToken: string): string | null {
+  try {
+    const parts = idToken.split('.')
+    if (parts.length !== 3) return null
+    const payloadB64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const pad = payloadB64.length % 4 === 0 ? '' : '='.repeat(4 - (payloadB64.length % 4))
+    const payload = JSON.parse(atob(payloadB64 + pad))
+    return typeof payload.email === 'string' ? payload.email : null
+  } catch (e) {
+    console.error('[gmail/exchange] id_token decode failed', e)
+    return null
+  }
 }
 
 function corsPreflight(): Response {

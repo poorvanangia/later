@@ -4,13 +4,17 @@ import { PendingSuggestionChip } from './PendingSuggestionChip'
 import { loadCategoryDescriptions, saveCategoryDescription } from '../lib/classifier'
 import { isCmdKHintVisible } from '../lib/hints'
 import { ReminderPopover } from './ReminderPopover'
-import { formatReminderLabel } from '../lib/reminders'
+import { formatReminderLabel, formatAcknowledgedAgo, getReminderState } from '../lib/reminders'
+import { SettingsPage } from './SettingsPage'
+import { OpenLoopsPage } from './OpenLoopsPage'
+import type { OpenLoop } from '../lib/openloops'
 
 // Bell icon — matches LinkRow's TagIcon convention: 11×11 render, 12×12
-// viewBox, 1.4 stroke, rounded caps, color inherited via currentColor so we
-// can drive muted grey (unset) vs accent green (reminder set) via CSS.
-const BellIcon = () => (
-  <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+// viewBox, 1.4 stroke, rounded caps, color inherited via currentColor.
+// `filled` swaps the stroke-only outline for a solid glyph, used to shout
+// "unacknowledged / overdue" without adding red.
+const BellIcon = ({ filled = false }: { filled?: boolean }) => (
+  <svg width="11" height="11" viewBox="0 0 12 12" fill={filled ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
     <path d="M6 1.5v.75" />
     <path d="M2.5 9.25V6a3.5 3.5 0 0 1 7 0v3.25" />
     <path d="M1.5 9.25h9" />
@@ -49,6 +53,12 @@ type Props = {
   onRejectSuggestion?: (id: string) => void
   onSetReminder?: (id: string, remindAtIso: string) => void
   onClearReminder?: (id: string) => void
+  openLoopsCount: number
+  openLoops: OpenLoop[]
+  onAcceptOpenLoop: (loop: OpenLoop) => void
+  onRejectOpenLoop: (loop: OpenLoop) => void
+  showOpenLoopsNudge: boolean
+  onDismissOpenLoopsNudge: () => void
 }
 
 export function LibraryPage({
@@ -58,6 +68,8 @@ export function LibraryPage({
   onDeleteItems, onSplitItem, onMergeItems,
   onAcceptSuggestion, onRejectSuggestion,
   onSetReminder, onClearReminder,
+  openLoopsCount, openLoops, onAcceptOpenLoop, onRejectOpenLoop,
+  showOpenLoopsNudge, onDismissOpenLoopsNudge,
 }: Props) {
   const [reminderOpenId, setReminderOpenId] = useState<string | null>(null)
   const [addingCat, setAddingCat] = useState(false)
@@ -600,6 +612,24 @@ export function LibraryPage({
       <div style={{ padding: '4px 12px', marginBottom: 20 }}>
         <span style={{ fontSize: 22, fontWeight: 900, color: '#1a1a1a', fontFamily: "'Playfair Display', serif", letterSpacing: '-0.3px' }}>Later<span style={{ color: '#2d8a4e' }}>.</span></span>
       </div>
+      {/* Open-loops queue lives ABOVE Home in the nav — it's the highest-
+          priority actionable item, unlike Home which is the full list. Label
+          IS the count. When zero, we keep the entry (per spec) but render it
+          muted so it reads as "you're caught up" rather than absent. */}
+      <button
+        onClick={() => { onNavigate('openloops'); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }}
+        style={{
+          display: 'block', width: '100%', textAlign: 'left',
+          padding: '9px 12px', fontSize: 15, marginBottom: 4,
+          fontWeight: activeView === 'openloops' ? 600 : 500,
+          color: openLoopsCount === 0 ? '#a8a8a4' : '#1a1a1a',
+          background: activeView === 'openloops' ? '#eeede9' : 'none',
+          border: 'none', borderRadius: 6, cursor: 'pointer',
+          fontFamily: "'Fraunces', serif",
+        }}
+      >
+        {openLoopsCount} open {openLoopsCount === 1 ? 'loop' : 'loops'}
+      </button>
       <button onClick={() => { onNavigate('library'); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '9px 12px', fontSize: 17, marginBottom: 16, fontWeight: activeView === 'library' ? 600 : 500, color: '#1a1a1a', background: activeView === 'library' ? '#eeede9' : 'none', border: 'none', borderRadius: 6, cursor: 'pointer', fontFamily: "'Fraunces', serif" }}>Home</button>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 12px', marginBottom: 12 }}>
         <span style={{ fontSize: 15, fontWeight: 600, color: '#9a9a94', fontFamily: "'Fraunces', serif" }}>Categories</span>
@@ -611,7 +641,19 @@ export function LibraryPage({
         const catDescription = categoryDescriptions[cat]
         if (editingCat === cat) {
           return (
-            <div key={cat} style={{ padding: '4px 4px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <div
+              key={cat}
+              // Wrapper-level blur commits when focus leaves BOTH inputs
+              // (name + description). Tabbing name → description doesn't
+              // trigger a submit because the new focus target is still inside
+              // this wrapper. Clicking anywhere outside the block dismisses.
+              onBlur={e => {
+                if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+                  submitEditCat()
+                }
+              }}
+              style={{ padding: '4px 4px', display: 'flex', flexDirection: 'column', gap: 4 }}
+            >
               <input
                 autoFocus
                 value={editingCatValue}
@@ -630,7 +672,6 @@ export function LibraryPage({
                   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submitEditCat()
                   if (e.key === 'Escape') { setEditingCat(null); setEditingCatValue(''); setEditingCatDescription('') }
                 }}
-                onBlur={submitEditCat}
                 placeholder="What belongs here? (optional)"
                 rows={2}
                 style={{ width: '100%', fontSize: 12, padding: '5px 8px', border: '1px solid #d8d8d4', borderRadius: 6, outline: 'none', background: '#fff', color: '#555', fontFamily: 'inherit', resize: 'none', lineHeight: '1.35' }}
@@ -658,7 +699,14 @@ export function LibraryPage({
         </div>)
       })}
       {addingCat && (
-        <div style={{ padding: '4px 4px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <div
+          onBlur={e => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+              submitNewCategory()
+            }
+          }}
+          style={{ padding: '4px 4px', display: 'flex', flexDirection: 'column', gap: 4 }}
+        >
           <input
             autoFocus
             value={newCatName}
@@ -677,19 +725,59 @@ export function LibraryPage({
               if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submitNewCategory()
               if (e.key === 'Escape') { setAddingCat(false); setNewCatName(''); setNewCatDescription('') }
             }}
-            onBlur={submitNewCategory}
             placeholder="What belongs here? (optional)"
             rows={2}
             style={{ width: '100%', fontSize: 12, padding: '5px 8px', border: '1px solid #d8d8d4', borderRadius: 6, outline: 'none', background: '#fff', color: '#555', fontFamily: 'inherit', resize: 'none', lineHeight: '1.35' }}
           />
         </div>
       )}
+      {/* Bottom-pinned settings link. Flex spacer above pushes it to the
+          bottom of the sidebar column so main nav (Home + Categories) stays
+          top-aligned as usual. */}
+      <div style={{ flex: 1, minHeight: 12 }} />
+      <button
+        onClick={() => { onNavigate('settings'); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }}
+        style={{ display: 'block', width: '100%', textAlign: 'left', padding: '8px 12px', fontSize: 13, fontWeight: activeView === 'settings' ? 600 : 400, color: activeView === 'settings' ? '#1a1a1a' : '#8a8a86', background: activeView === 'settings' ? '#eeede9' : 'none', border: 'none', borderRadius: 6, cursor: 'pointer', fontFamily: "'Fraunces', serif" }}
+      >
+        Settings
+      </button>
     </div>
   )
 
   const listPanel = (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
       <div style={{ flex: 1, overflowY: 'auto', padding: '48px 56px 24px' }}>
+        {/* First-run nudge — only on the Home view (the default library list),
+            only when there's a pending open-loops count the user hasn't yet
+            dismissed. App.tsx resets the dismissed flag when the count goes
+            back to zero, so a fresh 0→N transition re-shows this. */}
+        {activeView === 'library' && showOpenLoopsNudge && (
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '10px 14px', marginBottom: 20,
+            background: '#eef5f0', border: '1px solid #cfe0d5', borderRadius: 8,
+          }}>
+            <button
+              onClick={() => onNavigate('openloops')}
+              style={{
+                fontSize: 13, color: '#1e6b3a', background: 'none',
+                border: 'none', cursor: 'pointer', fontFamily: 'inherit',
+                padding: 0, fontWeight: 500,
+              }}
+            >
+              {openLoopsCount} new {openLoopsCount === 1 ? 'thing' : 'things'} to review →
+            </button>
+            <button
+              onClick={onDismissOpenLoopsNudge}
+              title="Dismiss"
+              style={{
+                fontSize: 15, color: '#8ba894', background: 'none',
+                border: 'none', cursor: 'pointer', fontFamily: 'inherit',
+                padding: '0 4px', lineHeight: 1,
+              }}
+            >×</button>
+          </div>
+        )}
         <h1 style={{ fontSize: 28, fontWeight: 600, color: '#1a1a1a', letterSpacing: '-0.5px', marginBottom: 24, lineHeight: 1.2 }}>{getPageTitle()}</h1>
         <div style={{ maxWidth: 640 }}>
           {sorted.map((link, index) => {
@@ -756,49 +844,100 @@ export function LibraryPage({
                       onReject={() => onRejectSuggestion?.(link.id)}
                     />
                   )}
-                  {/* Reminder — always visible when set, hover-only affordance
-                      when unset. Small clock icon opens the popover. */}
-                  {!hideCategoryUI && link.remind_at && (
-                    <button
-                      onMouseDown={e => e.stopPropagation()}
-                      onClick={e => { e.stopPropagation(); setReminderOpenId(reminderOpenId === link.id ? null : link.id) }}
-                      title={`Reminder set: ${new Date(link.remind_at).toLocaleString()} — click to change or clear`}
-                      style={{ fontSize: 11, color: '#2d8a4e', background: '#eef5f0', border: '1px solid #cfe0d5', borderRadius: 999, padding: '2px 9px 2px 8px', cursor: 'pointer', fontFamily: 'inherit', display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0, position: 'relative' }}
-                    >
-                      <BellIcon />
-                      <span>{formatReminderLabel(link.remind_at)}</span>
-                      {reminderOpenId === link.id && onSetReminder && onClearReminder && (
-                        <ReminderPopover
-                          currentRemindAt={link.remind_at}
-                          onSet={iso => onSetReminder(link.id, iso)}
-                          onClear={() => onClearReminder(link.id)}
-                          onClose={() => setReminderOpenId(null)}
-                        />
-                      )}
-                    </button>
-                  )}
-                  {!hideCategoryUI && !link.remind_at && (isHovered || reminderOpenId === link.id) && (
-                    <div style={{ position: 'relative', flexShrink: 0 }}>
-                      <button
-                        onMouseDown={e => e.stopPropagation()}
-                        onClick={e => { e.stopPropagation(); setReminderOpenId(reminderOpenId === link.id ? null : link.id) }}
-                        title="Add reminder"
-                        style={{ color: '#bbb', background: 'transparent', border: 'none', cursor: 'pointer', padding: '3px 5px', fontFamily: 'inherit', display: 'flex', alignItems: 'center', borderRadius: 4, transition: 'color 0.12s, background 0.12s' }}
-                        onMouseEnter={e => { e.currentTarget.style.color = '#666'; e.currentTarget.style.background = '#f2f1ed' }}
-                        onMouseLeave={e => { e.currentTarget.style.color = '#bbb'; e.currentTarget.style.background = 'transparent' }}
-                      >
-                        <BellIcon />
-                      </button>
-                      {reminderOpenId === link.id && onSetReminder && onClearReminder && (
-                        <ReminderPopover
-                          currentRemindAt={link.remind_at}
-                          onSet={iso => onSetReminder(link.id, iso)}
-                          onClear={() => onClearReminder(link.id)}
-                          onClose={() => setReminderOpenId(null)}
-                        />
-                      )}
-                    </div>
-                  )}
+                  {/* Reminder bell — state machine derived from remind_at +
+                      acknowledged_at via getReminderState. Rendering rules:
+                        - none          → hover-only add-affordance
+                        - upcoming      → muted grey chip with outline bell + relative time
+                        - overdue       → solid accent-green filled bell + when
+                        - acknowledged  → quiet neutral bell with "reminded X ago" tooltip
+                      All three "set" states open the same ReminderPopover on click. */}
+                  {!hideCategoryUI && (() => {
+                    const rState = getReminderState(link)
+                    const openPopover = reminderOpenId === link.id
+                    const showPopover = openPopover && onSetReminder && onClearReminder
+                    const popover = showPopover ? (
+                      <ReminderPopover
+                        currentRemindAt={link.remind_at}
+                        onSet={iso => onSetReminder!(link.id, iso)}
+                        onClear={() => onClearReminder!(link.id)}
+                        onClose={() => setReminderOpenId(null)}
+                      />
+                    ) : null
+
+                    // Add-affordance for items with no reminder — only shows on
+                    // row hover or when the popover is open (so the popover
+                    // doesn't slam shut when the mouse leaves the row).
+                    if (rState === 'none') {
+                      if (!isHovered && !openPopover) return null
+                      return (
+                        <div style={{ position: 'relative', flexShrink: 0 }}>
+                          <button
+                            onMouseDown={e => e.stopPropagation()}
+                            onClick={e => { e.stopPropagation(); setReminderOpenId(openPopover ? null : link.id) }}
+                            title="Add reminder"
+                            style={{ color: '#bbb', background: 'transparent', border: 'none', cursor: 'pointer', padding: '3px 5px', fontFamily: 'inherit', display: 'flex', alignItems: 'center', borderRadius: 4, transition: 'color 0.12s, background 0.12s' }}
+                            onMouseEnter={e => { e.currentTarget.style.color = '#666'; e.currentTarget.style.background = '#f2f1ed' }}
+                            onMouseLeave={e => { e.currentTarget.style.color = '#bbb'; e.currentTarget.style.background = 'transparent' }}
+                          >
+                            <BellIcon />
+                          </button>
+                          {popover}
+                        </div>
+                      )
+                    }
+
+                    // Upcoming — muted grey chip. Not shouty; just present.
+                    if (rState === 'upcoming') {
+                      return (
+                        <button
+                          onMouseDown={e => e.stopPropagation()}
+                          onClick={e => { e.stopPropagation(); setReminderOpenId(openPopover ? null : link.id) }}
+                          title={`Reminder set for ${new Date(link.remind_at!).toLocaleString()} — click to change or clear`}
+                          style={{ fontSize: 11, color: '#7a7a76', background: '#f2f1ed', border: '1px solid #e0dfd9', borderRadius: 999, padding: '2px 9px 2px 8px', cursor: 'pointer', fontFamily: 'inherit', display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0, position: 'relative' }}
+                        >
+                          <BellIcon />
+                          <span>{formatReminderLabel(link.remind_at!)}</span>
+                          {popover}
+                        </button>
+                      )
+                    }
+
+                    // Overdue — solid accent-green filled bell. Acts as safety
+                    // net if the user missed the popup. Green, not red, per spec.
+                    if (rState === 'overdue') {
+                      return (
+                        <button
+                          onMouseDown={e => e.stopPropagation()}
+                          onClick={e => { e.stopPropagation(); setReminderOpenId(openPopover ? null : link.id) }}
+                          title={`Overdue — was scheduled for ${new Date(link.remind_at!).toLocaleString()}`}
+                          style={{ fontSize: 11, color: '#2d8a4e', background: '#eef5f0', border: '1px solid #cfe0d5', borderRadius: 999, padding: '2px 9px 2px 8px', cursor: 'pointer', fontFamily: 'inherit', display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0, position: 'relative' }}
+                        >
+                          <BellIcon filled />
+                          <span>{formatReminderLabel(link.remind_at!)}</span>
+                          {popover}
+                        </button>
+                      )
+                    }
+
+                    // Acknowledged — quiet trace. No chip background, just the
+                    // small bell, so it fades into the row while still leaving
+                    // an audit trail via the tooltip.
+                    return (
+                      <div style={{ position: 'relative', flexShrink: 0 }}>
+                        <button
+                          onMouseDown={e => e.stopPropagation()}
+                          onClick={e => { e.stopPropagation(); setReminderOpenId(openPopover ? null : link.id) }}
+                          title={link.acknowledged_at ? formatAcknowledgedAgo(link.acknowledged_at) : 'Reminded'}
+                          style={{ color: '#c8c6c1', background: 'transparent', border: 'none', cursor: 'pointer', padding: '3px 5px', fontFamily: 'inherit', display: 'flex', alignItems: 'center', borderRadius: 4, transition: 'color 0.12s, background 0.12s' }}
+                          onMouseEnter={e => { e.currentTarget.style.color = '#8a8a86'; e.currentTarget.style.background = '#f5f4f1' }}
+                          onMouseLeave={e => { e.currentTarget.style.color = '#c8c6c1'; e.currentTarget.style.background = 'transparent' }}
+                        >
+                          <BellIcon />
+                        </button>
+                        {popover}
+                      </div>
+                    )
+                  })()}
                   {!link.pending_suggestion && (isHovered || dropdownOpen) && !hideCategoryUI && (
                     <div style={{ position: 'relative', flexShrink: 0 }}>
                       <button
@@ -882,8 +1021,12 @@ export function LibraryPage({
   return (
     <div style={{ display: 'flex', height: '100vh', background: '#fafaf9', overflow: 'hidden', position: 'relative' }}>
       {sidebar}
-      {listPanel}
-      {detailPanel}
+      {activeView === 'settings' ? (
+        <SettingsPage />
+      ) : activeView === 'openloops' ? (
+        <OpenLoopsPage loops={openLoops} onAccept={onAcceptOpenLoop} onReject={onRejectOpenLoop} />
+      ) : listPanel}
+      {activeView !== 'settings' && activeView !== 'openloops' && detailPanel}
       {showCmdKHint && <CmdKHint />}
     </div>
   )

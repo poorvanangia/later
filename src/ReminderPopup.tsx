@@ -9,6 +9,14 @@
 // Warm cream card with soft frosted-glass backdrop. Fully rounded corners on
 // all four sides — window itself is transparent so the pixels outside the
 // card's border-radius render as invisible.
+//
+// Persistence: this popup writes fired_at and acknowledged_at directly to
+// localStorage. Tauri v2 webviews under the same tauri://localhost origin
+// share localStorage with the library window, so state updates land even
+// if the library isn't currently mounted. See lib/reminders.ts::patchLinkFields.
+
+import { useEffect } from 'react'
+import { patchLinkFields } from './lib/reminders'
 
 const params = new URLSearchParams(window.location.search)
 const linkId = params.get('id') ?? ''
@@ -18,22 +26,29 @@ const IOS_BLUE = '#007aff'
 const CARD_RADIUS = 16
 
 export function ReminderPopup() {
-  const onOkay = async () => {
+  // Mark the reminder as presented as soon as the popup appears. If the user
+  // ignores it and the app quits, we still won't re-fire on next boot.
+  useEffect(() => {
+    if (!linkId) return
+    void patchLinkFields(linkId, { fired_at: new Date().toISOString() })
+  }, [])
+
+  const ackAndInvoke = async (cmd: 'close_reminder_window' | 'open_item_from_reminder') => {
+    // Persist acknowledged_at BEFORE closing the window — otherwise the
+    // webview may already be dead by the time the localStorage write lands,
+    // depending on how fast Tauri tears it down.
+    if (linkId) {
+      await patchLinkFields(linkId, { acknowledged_at: new Date().toISOString() })
+    }
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      await invoke('close_reminder_window', { linkId })
+      await invoke(cmd, { linkId })
     } catch (e) {
-      console.error('close_reminder_window failed', e)
+      console.error(cmd, 'failed', e)
     }
   }
-  const onView = async () => {
-    try {
-      const { invoke } = await import('@tauri-apps/api/core')
-      await invoke('open_item_from_reminder', { linkId })
-    } catch (e) {
-      console.error('open_item_from_reminder failed', e)
-    }
-  }
+  const onOkay = () => { void ackAndInvoke('close_reminder_window') }
+  const onView = () => { void ackAndInvoke('open_item_from_reminder') }
 
   return (
     <div

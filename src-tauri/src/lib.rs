@@ -8,12 +8,39 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
+mod gmail_config;
+mod gmail_oauth;
+
 // Registry of in-flight reminder tasks. Each entry is a JoinHandle we can
 // abort when the user cancels or replaces a reminder. Keyed by link id.
 // Cleared on task completion so we never abort a fired reminder.
 static REMINDER_TASKS: Mutex<Option<HashMap<String, tokio::task::JoinHandle<()>>>> = Mutex::new(None);
 
-const REMINDER_FIRED_EVENT: &str = "later://reminder-fired";
+// Queue serializing popup display: at most one reminder card is on screen at a
+// time. When a timer fires and a card is already showing, the new one goes
+// into `queue`; `current` is the link id of what's visible. When a card is
+// dismissed (Okay or View), we pop the queue entry with the *earliest*
+// remind_at_iso — i.e. most-overdue first — and show it next.
+struct ReminderQueue {
+    current: Option<String>,
+    queue: Vec<QueuedReminder>,
+}
+struct QueuedReminder {
+    link_id: String,
+    title: String,
+    // Kept as ISO string so we can sort lexicographically once normalized to a
+    // common representation via parse_iso_to_unix. Multiple offsets in the
+    // wild — always parse before comparing.
+    remind_at_iso: String,
+}
+static REMINDER_QUEUE: Mutex<Option<ReminderQueue>> = Mutex::new(None);
+
+// Fired when the user clicks the View button — library listens and scrolls
+// to the item. Not the same as the (retired) "reminder-fired" name, which
+// was overloaded and confusing. Popup itself now writes acknowledged_at
+// straight to localStorage (shared across webviews on the same protocol),
+// so we no longer need a separate ack event on the wire.
+const REMINDER_VIEW_EVENT: &str = "later://reminder-view-requested";
 
 const POPUP_LABEL: &str = "popup";
 const SPOTLIGHT_LABEL: &str = "main";
@@ -289,7 +316,7 @@ async fn open_library(app: tauri::AppHandle) {
 
 // Schedule a one-time reminder for `link_id`. Any prior task for the same id
 // is aborted (v1 rule: setting a new reminder replaces the old one — never
-// stacks). If `remind_at_iso` is already in the past, the notification fires
+// stacks). If `remind_at_iso` is already in the past, the popup enqueues
 // immediately, matching the "missed reminder" fallback for reminders that
 // were scheduled before the app was quit.
 #[tauri::command]
@@ -310,16 +337,16 @@ async fn schedule_reminder(
     let app_handle = app.clone();
     let title_for_task = title.clone();
     let id_for_task = link_id.clone();
+    let iso_for_task = remind_at_iso.clone();
     let handle = tokio::spawn(async move {
         let now = std::time::Instant::now();
         if when > now {
             tokio::time::sleep(when - now).await;
         }
-        // Fire the notification.
-        // Show the custom reminder card in the top-right corner instead of a
-        // native macOS notification. The card doesn't steal focus and stays
-        // put until the user hits Okay or View.
-        show_reminder_window(&app_handle, &id_for_task, &title_for_task);
+        // Timer fired: try to show the popup, or queue it if another is up.
+        // The card doesn't steal focus and stays put until the user hits
+        // Okay or View — hence the strict one-at-a-time invariant.
+        show_or_enqueue(&app_handle, &id_for_task, &title_for_task, &iso_for_task);
         // Remove the completed task from the registry.
         let mut guard = REMINDER_TASKS.lock().unwrap();
         if let Some(map) = guard.as_mut() {
@@ -333,11 +360,31 @@ async fn schedule_reminder(
     Ok(())
 }
 
-// Cancel a pending reminder for `link_id`. Safe to call even if there was
-// no active task (no-op in that case).
+// Cancel a pending reminder for `link_id`. Aborts any tokio task, drops the
+// entry from the queue, and closes the popup if it's currently showing.
+// Safe to call even if nothing is active.
 #[tauri::command]
-async fn cancel_reminder(link_id: String) {
+async fn cancel_reminder(app: tauri::AppHandle, link_id: String) {
     cancel_reminder_task(&link_id);
+    // Remove from queue if pending.
+    {
+        let mut guard = REMINDER_QUEUE.lock().unwrap();
+        if let Some(state) = guard.as_mut() {
+            state.queue.retain(|q| q.link_id != link_id);
+        }
+    }
+    // If it's the one on screen, close the window and advance the queue.
+    let is_current = {
+        let guard = REMINDER_QUEUE.lock().unwrap();
+        guard.as_ref().and_then(|s| s.current.as_ref()) == Some(&link_id)
+    };
+    if is_current {
+        let label = reminder_label(&link_id);
+        if let Some(w) = app.get_webview_window(&label) {
+            let _ = w.close();
+        }
+        advance_queue(&app);
+    }
 }
 
 fn cancel_reminder_task(link_id: &str) {
@@ -346,6 +393,56 @@ fn cancel_reminder_task(link_id: &str) {
         if let Some(handle) = map.remove(link_id) {
             handle.abort();
         }
+    }
+}
+
+// Timer-fire entry point. If nothing is currently on screen, this becomes the
+// current popup and shows. Otherwise it joins the queue. Dedup: if link_id is
+// already the current popup or already in the queue (e.g. two reschedules for
+// the same item race the same tick), silently drop the new one — the existing
+// entry wins.
+fn show_or_enqueue(app: &tauri::AppHandle, link_id: &str, title: &str, remind_at_iso: &str) {
+    let should_show_now = {
+        let mut guard = REMINDER_QUEUE.lock().unwrap();
+        let state = guard.get_or_insert_with(|| ReminderQueue { current: None, queue: Vec::new() });
+        // Dedup against current + queue.
+        if state.current.as_deref() == Some(link_id) { return; }
+        if state.queue.iter().any(|q| q.link_id == link_id) { return; }
+        if state.current.is_none() {
+            state.current = Some(link_id.to_string());
+            true
+        } else {
+            state.queue.push(QueuedReminder {
+                link_id: link_id.to_string(),
+                title: title.to_string(),
+                remind_at_iso: remind_at_iso.to_string(),
+            });
+            false
+        }
+    };
+    if should_show_now {
+        show_reminder_window(app, link_id, title);
+    }
+}
+
+// Called after a popup is dismissed (Okay / View / cancel). Picks the
+// most-overdue queued reminder (earliest remind_at_iso) and shows it next.
+// Leaves `current` empty if the queue is empty.
+fn advance_queue(app: &tauri::AppHandle) {
+    let next = {
+        let mut guard = REMINDER_QUEUE.lock().unwrap();
+        let Some(state) = guard.as_mut() else { return };
+        state.current = None;
+        if state.queue.is_empty() { return; }
+        // Sort ascending by parsed remind_at (earliest first = most overdue).
+        // Failure to parse sorts last so a bad entry doesn't block the good ones.
+        state.queue.sort_by_key(|q| parse_iso_to_unix(&q.remind_at_iso).unwrap_or(i64::MAX));
+        let picked = state.queue.remove(0);
+        state.current = Some(picked.link_id.clone());
+        Some(picked)
+    };
+    if let Some(q) = next {
+        show_reminder_window(app, &q.link_id, &q.title);
     }
 }
 
@@ -432,41 +529,193 @@ fn show_reminder_window(app: &tauri::AppHandle, link_id: &str, body_text: &str) 
 }
 
 // Close a reminder card. Called by the "Okay" button; also invoked by
-// open_item_from_reminder before it switches focus to the vault.
+// open_item_from_reminder before it switches focus to the vault. The popup
+// itself persists acknowledged_at to localStorage before invoking this — we
+// only handle window teardown and queue advancement here.
 #[tauri::command]
 async fn close_reminder_window(app: tauri::AppHandle, link_id: String) {
     let label = reminder_label(&link_id);
     if let Some(w) = app.get_webview_window(&label) {
         let _ = w.close();
     }
+    advance_queue(&app);
 }
 
 // "View" button: open the main vault window, emit an event carrying the item
 // id so the frontend can scroll to and highlight the item, and dismiss the
-// reminder card.
+// reminder card. Acknowledgment persistence happens in the popup itself.
 #[tauri::command]
 async fn open_item_from_reminder(app: tauri::AppHandle, link_id: String) {
     show_or_open_library(&app);
-    if let Err(e) = app.emit(REMINDER_FIRED_EVENT, &link_id) {
-        eprintln!("[later] emit reminder-fired failed: {}", e);
+    if let Err(e) = app.emit(REMINDER_VIEW_EVENT, &link_id) {
+        eprintln!("[later] emit reminder-view-requested failed: {}", e);
     }
     let label = reminder_label(&link_id);
     if let Some(w) = app.get_webview_window(&label) {
         let _ = w.close();
     }
+    advance_queue(&app);
 }
 
-// Convert an ISO 8601 timestamp string to a tokio Instant relative to now.
-// We're deliberately not pulling in `chrono` — this parses just enough to
-// compute the delta from the current UNIX time to the target UNIX time and
-// build an Instant from it.
-fn parse_iso_to_instant(iso: &str) -> Option<std::time::Instant> {
-    // Formats we accept:
-    //   2026-09-09T09:00:00Z
-    //   2026-09-09T09:00:00.000Z
-    //   2026-09-09T09:00:00-07:00
-    //   2026-09-09T09:00:00.123-07:00
-    // Extract date + time + optional millis + timezone offset.
+// ---------- Gmail commands ----------
+//
+// connect_gmail runs the whole loopback OAuth dance (see gmail_oauth.rs)
+// and stores the refresh_token in the macOS Keychain. Returns the connected
+// account's email address on success. The frontend never sees the token.
+//
+// disconnect_gmail wipes the keychain entry. Doesn't revoke on Google's side
+// — that's the user's job in their Google Account settings, and doing it
+// programmatically requires an extra scope we don't want.
+//
+// gmail_connection_status is a cheap check the Settings page hits on mount
+// so it can show "Connected" without waiting for a full round-trip.
+#[tauri::command]
+async fn connect_gmail() -> Result<gmail_oauth::ConnectOk, gmail_oauth::ConnectError> {
+    gmail_oauth::run_connect_flow().await
+}
+
+#[tauri::command]
+async fn disconnect_gmail() -> Result<(), gmail_oauth::ConnectError> {
+    gmail_oauth::disconnect()
+}
+
+#[tauri::command]
+async fn gmail_connection_status() -> serde_json::Value {
+    serde_json::json!({
+        "connected": gmail_oauth::is_connected(),
+        "configured": gmail_config::is_configured(),
+    })
+}
+
+// Fetch new mail from Gmail via the worker. JS passes the last known
+// history_id (or null for initial fetch) and the worker returns metadata for
+// each new message plus the new history cursor. Rust reads the refresh_token
+// from Keychain so it never crosses the IPC boundary.
+#[tauri::command]
+async fn gmail_sync(since_history_id: Option<String>) -> serde_json::Value {
+    let refresh_token = match keyring::Entry::new(gmail_config::KEYCHAIN_SERVICE, gmail_config::KEYCHAIN_ACCOUNT_REFRESH)
+        .and_then(|e| e.get_password())
+    {
+        Ok(t) => t,
+        Err(_) => return serde_json::json!({ "error": "not_connected" }),
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return serde_json::json!({ "error": "http_client_build_failed", "detail": e.to_string() }),
+    };
+
+    let mut body = serde_json::json!({ "refresh_token": refresh_token });
+    if let Some(hid) = since_history_id {
+        body["since_history_id"] = serde_json::Value::String(hid);
+    }
+
+    match client
+        .post(format!("{}/gmail/sync", LATER_API_BASE))
+        .header("X-Later-Auth", LATER_API_KEY)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(res) => {
+            let status = res.status();
+            match res.json::<serde_json::Value>().await {
+                Ok(j) => {
+                    if !status.is_success() {
+                        return serde_json::json!({ "error": "worker_error", "status": status.as_u16(), "detail": j });
+                    }
+                    j
+                }
+                Err(e) => serde_json::json!({ "error": "parse_failed", "detail": e.to_string() }),
+            }
+        }
+        Err(e) => serde_json::json!({ "error": "request_failed", "detail": e.to_string() }),
+    }
+}
+
+// Run LLM extraction on a batch of synced messages. JS passes the messages
+// verbatim from gmail_sync's output plus optional user_profile context.
+// Worker handles the Anthropic call and returns per-index verdicts.
+#[tauri::command]
+async fn extract_openloops(
+    messages: serde_json::Value,
+    user_profile: Option<String>,
+    user_email: Option<String>,
+) -> serde_json::Value {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return serde_json::json!({ "error": "http_client_build_failed", "detail": e.to_string() }),
+    };
+
+    let now_iso = chrono_like_now_iso();
+
+    let body = serde_json::json!({
+        "messages": messages,
+        "user_profile": user_profile.unwrap_or_default(),
+        "user_email": user_email.unwrap_or_default(),
+        "now_iso": now_iso,
+    });
+
+    match client
+        .post(format!("{}/extract_openloop", LATER_API_BASE))
+        .header("X-Later-Auth", LATER_API_KEY)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(res) => {
+            let status = res.status();
+            match res.json::<serde_json::Value>().await {
+                Ok(j) => {
+                    if !status.is_success() {
+                        return serde_json::json!({ "error": "worker_error", "status": status.as_u16(), "detail": j });
+                    }
+                    j
+                }
+                Err(e) => serde_json::json!({ "error": "parse_failed", "detail": e.to_string() }),
+            }
+        }
+        Err(e) => serde_json::json!({ "error": "request_failed", "detail": e.to_string() }),
+    }
+}
+
+// Minimal ISO 8601 UTC formatter — same "don't pull chrono" stance as the
+// reminder parser. Only used to stamp the extraction prompt's "current time"
+// hint, so precision to the second is plenty.
+fn chrono_like_now_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // days-from-civil-inverse (Hinnant), then h/m/s from remainder.
+    let z = secs.div_euclid(86400) + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    let rem = secs.rem_euclid(86400);
+    let hh = (rem / 3600) as u32;
+    let mm = ((rem % 3600) / 60) as u32;
+    let ss = (rem % 60) as u32;
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hh, mm, ss)
+}
+
+// Parse ISO 8601 into UNIX seconds. Used to compare/sort remind_at values
+// across timezones — the queue picks the smallest (earliest = most overdue).
+fn parse_iso_to_unix(iso: &str) -> Option<i64> {
     let bytes = iso.as_bytes();
     if bytes.len() < 19 { return None; }
     let year: i64 = iso.get(0..4)?.parse().ok()?;
@@ -476,10 +725,8 @@ fn parse_iso_to_instant(iso: &str) -> Option<std::time::Instant> {
     let minute: u32 = iso.get(14..16)?.parse().ok()?;
     let second: u32 = iso.get(17..19)?.parse().ok()?;
 
-    // Timezone suffix. Look for Z or +hh:mm / -hh:mm at the end.
     let mut offset_seconds: i64 = 0;
     let rest = &iso[19..];
-    // Skip optional .fractional
     let after_frac = if let Some(dot_pos) = rest.find('.') {
         let after_dot = &rest[dot_pos + 1..];
         let end = after_dot.chars().take_while(|c| c.is_ascii_digit()).count();
@@ -499,7 +746,7 @@ fn parse_iso_to_instant(iso: &str) -> Option<std::time::Instant> {
         }
     }
 
-    // Convert to UNIX seconds using days-from-civil algorithm (Howard Hinnant).
+    // days-from-civil (Howard Hinnant).
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64;
@@ -507,17 +754,23 @@ fn parse_iso_to_instant(iso: &str) -> Option<std::time::Instant> {
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u64;
     let days_from_epoch = era * 146097 + doe as i64 - 719468;
-    let target_unix = days_from_epoch * 86400
+    Some(days_from_epoch * 86400
         + (hour as i64) * 3600
         + (minute as i64) * 60
         + second as i64
-        - offset_seconds;
+        - offset_seconds)
+}
 
+// Convert an ISO 8601 timestamp string to a tokio Instant relative to now.
+// We're deliberately not pulling in `chrono` — parse_iso_to_unix handles the
+// calendar math; we just translate the delta into an Instant here.
+// Formats accepted: 2026-09-09T09:00:00[.fff][Z|+hh:mm|-hh:mm]
+fn parse_iso_to_instant(iso: &str) -> Option<std::time::Instant> {
+    let target_unix = parse_iso_to_unix(iso)?;
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs() as i64;
-
     let now_instant = std::time::Instant::now();
     if target_unix <= now_unix {
         // Past — return "now" so the task fires immediately.
@@ -668,7 +921,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
-        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, reclassify_item, generate_title, open_library, hide_spotlight, submit_email, finalize_first_launch, schedule_reminder, cancel_reminder, close_reminder_window, open_item_from_reminder])
+        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, reclassify_item, generate_title, open_library, hide_spotlight, submit_email, finalize_first_launch, schedule_reminder, cancel_reminder, close_reminder_window, open_item_from_reminder, connect_gmail, disconnect_gmail, gmail_connection_status, gmail_sync, extract_openloops])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
