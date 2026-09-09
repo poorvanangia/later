@@ -19,7 +19,6 @@ import { loadUserProfileText } from './lib/profile'
 import { scheduleReminderNative, cancelReminderNative } from './lib/reminders'
 import { startPollLoop } from './lib/gmailSync'
 import { loadOpenLoops, markAccepted, markRejected, loadGmailHistoryId, type OpenLoop } from './lib/openloops'
-import { OpenLoopsPage } from './components/OpenLoopsPage'
 
 const SYNC_EVENT = 'later://state-changed'
 
