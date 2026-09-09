@@ -28,7 +28,7 @@ export function HomePage({ onSave, onViewLibrary, onSignIn, isSignedIn }: Props)
     <div style={{ minHeight: '100vh', background: '#fafaf9', display: 'flex', flexDirection: 'column' }}>
       {/* Top bar */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '24px 32px' }}>
-        <span style={{ fontSize: 18, fontWeight: 600, color: '#1a1a1a', fontFamily: "'Fraunces', serif", letterSpacing: '-0.2px' }}>Later<span style={{ color: '#a10808' }}>.</span></span>
+        <span style={{ fontSize: 18, fontWeight: 900, color: '#1a1a1a', fontFamily: "'Playfair Display', serif", letterSpacing: '-0.2px' }}>Later<span style={{ color: '#2d8a4e' }}>.</span></span>
         {!isSignedIn && (
           <button
             onClick={onSignIn}

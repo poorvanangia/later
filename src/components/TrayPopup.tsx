@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import type { LinkRow } from '../App'
+import { PendingSuggestionChip } from './PendingSuggestionChip'
 
 const PLACEHOLDERS = [
   'Paste a link, write a note, or save anything…',
@@ -20,11 +21,13 @@ type Props = {
   onDone: (id: string) => void
   onCategoryChange: (id: string, category: string) => void
   onAddCategory: (name: string) => void
+  onAcceptSuggestion?: (id: string) => void
+  onRejectSuggestion?: (id: string) => void
   isSignedIn: boolean
   onSignIn: () => void
 }
 
-export function TrayPopup({ links, categories, onSave, onDone, onCategoryChange, onAddCategory }: Props) {
+export function TrayPopup({ links, categories, onSave, onDone, onCategoryChange, onAddCategory, onAcceptSuggestion, onRejectSuggestion }: Props) {
   const [value, setValue] = useState('')
   const [justSaved, setJustSaved] = useState(false)
   const [placeholderIndex, setPlaceholderIndex] = useState(0)
@@ -116,10 +119,10 @@ export function TrayPopup({ links, categories, onSave, onDone, onCategoryChange,
         padding: '14px 20px 10px', cursor: 'default', flexShrink: 0,
       }}>
         <span style={{
-          fontSize: 16, fontWeight: 600, color: '#1a1a1a',
-          fontFamily: "'Fraunces', serif", letterSpacing: '-0.2px',
+          fontSize: 16, fontWeight: 900, color: '#1a1a1a',
+          fontFamily: "'Playfair Display', serif", letterSpacing: '-0.2px',
         }}>
-          Later<span style={{ color: '#a10808' }}>.</span>
+          Later<span style={{ color: '#2d8a4e' }}>.</span>
         </span>
       </div>
 
@@ -232,7 +235,14 @@ export function TrayPopup({ links, categories, onSave, onDone, onCategoryChange,
                   >
                     {displayTitle}
                   </a>
-                  {(isHovered || dropdownOpen) && (
+                  {link.pending_suggestion && (
+                    <PendingSuggestionChip
+                      suggestion={link.pending_suggestion}
+                      onAccept={() => onAcceptSuggestion?.(link.id)}
+                      onReject={() => onRejectSuggestion?.(link.id)}
+                    />
+                  )}
+                  {!link.pending_suggestion && (isHovered || dropdownOpen) && (
                     <div style={{ position: 'relative', flexShrink: 0 }}>
                       <button
                         onMouseDown={(e) => {

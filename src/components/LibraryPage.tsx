@@ -1,5 +1,22 @@
 import { useState, useRef, useEffect } from 'react'
 import type { LinkRow } from '../App'
+import { PendingSuggestionChip } from './PendingSuggestionChip'
+import { loadCategoryDescriptions, saveCategoryDescription } from '../lib/classifier'
+import { isCmdKHintVisible } from '../lib/hints'
+import { ReminderPopover } from './ReminderPopover'
+import { formatReminderLabel } from '../lib/reminders'
+
+// Bell icon — matches LinkRow's TagIcon convention: 11×11 render, 12×12
+// viewBox, 1.4 stroke, rounded caps, color inherited via currentColor so we
+// can drive muted grey (unset) vs accent green (reminder set) via CSS.
+const BellIcon = () => (
+  <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M6 1.5v.75" />
+    <path d="M2.5 9.25V6a3.5 3.5 0 0 1 7 0v3.25" />
+    <path d="M1.5 9.25h9" />
+    <path d="M4.75 10.5a1.25 1.25 0 0 0 2.5 0" />
+  </svg>
+)
 
 function getDomain(url: string): string {
   try { return new URL(url).hostname.replace('www.', '') }
@@ -17,7 +34,7 @@ type Props = {
   activeView: string
   search: string
   onNavigate: (view: string) => void
-  onAddCategory: (name: string) => void
+  onAddCategory: (name: string, description?: string) => void
   onDone: (id: string) => void
   onSearchChange: (q: string) => void
   onCategoryChange: (id: string, category: string) => void
@@ -28,6 +45,10 @@ type Props = {
   onDeleteItems?: (ids: string[]) => void
   onSplitItem?: (id: string, before: string, after: string, newId: string) => void
   onMergeItems?: (intoId: string, fromId: string, intoText: string, fromText: string) => void
+  onAcceptSuggestion?: (id: string) => void
+  onRejectSuggestion?: (id: string) => void
+  onSetReminder?: (id: string, remindAtIso: string) => void
+  onClearReminder?: (id: string) => void
 }
 
 export function LibraryPage({
@@ -35,16 +56,23 @@ export function LibraryPage({
   onNavigate, onAddCategory, onDone, onSearchChange, onCategoryChange,
   onDeleteCategory, onUpdateItem, onAddItem, onDeleteItem,
   onDeleteItems, onSplitItem, onMergeItems,
+  onAcceptSuggestion, onRejectSuggestion,
+  onSetReminder, onClearReminder,
 }: Props) {
+  const [reminderOpenId, setReminderOpenId] = useState<string | null>(null)
   const [addingCat, setAddingCat] = useState(false)
   const [newCatName, setNewCatName] = useState('')
+  const [newCatDescription, setNewCatDescription] = useState('')
   const [editingCat, setEditingCat] = useState<string | null>(null)
   const [editingCatValue, setEditingCatValue] = useState('')
+  const [editingCatDescription, setEditingCatDescription] = useState('')
+  const [categoryDescriptions, setCategoryDescriptions] = useState<Record<string, string>>(() => loadCategoryDescriptions())
   const [newLineValue, setNewLineValue] = useState('')
   const [openDropdownId, setOpenDropdownId] = useState<string | null>(null)
   const [addingCatInline, setAddingCatInline] = useState(false)
   const [inlineCatValue, setInlineCatValue] = useState('')
   const [hoveredItemId, setHoveredItemId] = useState<string | null>(null)
+  const [hoveredCat, setHoveredCat] = useState<string | null>(null)
   const [selectedItem, setSelectedItem] = useState<LinkRow | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [lastIndex, setLastIndex] = useState<number | null>(null)
@@ -53,6 +81,22 @@ export function LibraryPage({
   const newLineRef = useRef<HTMLInputElement>(null)
   const inputRefs = useRef<Record<string, HTMLInputElement | null>>({})
   const dropdownRef = useRef<HTMLDivElement>(null)
+
+  // Re-read descriptions when categories change — covers the case where
+  // handleAcceptSuggestion in App.tsx wrote a new description via localStorage
+  // while a suggest_new chip was confirmed.
+  useEffect(() => {
+    setCategoryDescriptions(loadCategoryDescriptions())
+  }, [categories])
+
+  // Cmd+K hint visibility: subtle bottom-right pill shown until the user has
+  // pressed Cmd+K enough times (threshold = 7) to have muscle memory.
+  // Re-reads on links change so it disappears after the same SYNC_EVENT that
+  // spotlight fires when the counter bumps.
+  const [showCmdKHint, setShowCmdKHint] = useState<boolean>(() => isCmdKHintVisible())
+  useEffect(() => {
+    setShowCmdKHint(isCmdKHintVisible())
+  }, [links])
 
   const filtered = links.filter((l) => {
     const matchesView =
@@ -80,7 +124,7 @@ export function LibraryPage({
   }
 
   const getPageTitle = () => {
-    if (activeView === 'library') return 'All Items'
+    if (activeView === 'library') return 'Home'
     if (activeView.startsWith('cat:')) return activeView.slice(4)
     return 'Items'
   }
@@ -163,10 +207,13 @@ export function LibraryPage({
         return
       }
 
-      // Cmd+Shift+ArrowDown/Up — extend (or initiate) the multi-select by one line.
-      // Works both from a focused input (initiates from that row) and from no-focus
-      // multi-select mode (extends from lastIndex). Mirrors Finder/Notes behaviour.
-      if (e.metaKey && e.shiftKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+      // Cmd+Shift+ArrowDown/Up (from anywhere) OR plain Shift+ArrowDown/Up (only when
+      // no input is focused, so we don't fight the native text-selection behaviour) —
+      // extend (or initiate) the multi-select by one line. Mirrors Finder/Notes.
+      const isMultiSelectExtend =
+        (e.metaKey && e.shiftKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) ||
+        (!isInputFocused && !e.metaKey && e.shiftKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp'))
+      if (isMultiSelectExtend) {
         e.preventDefault()
         const dir = e.key === 'ArrowDown' ? 1 : -1
 
@@ -265,7 +312,14 @@ export function LibraryPage({
   const commitEdit = (id: string) => {
     setEdits(prev => {
       if (prev[id] === undefined) return prev
-      if (onUpdateItem) onUpdateItem(id, { title: prev[id] })
+      const value = prev[id]
+      // Backspacing a title to empty means the user wants the item gone.
+      // Delete it outright instead of committing a blank row.
+      if (value.trim() === '' && onDeleteItem) {
+        onDeleteItem(id)
+      } else if (onUpdateItem) {
+        onUpdateItem(id, { title: value })
+      }
       const next = { ...prev }
       delete next[id]
       return next
@@ -441,7 +495,7 @@ export function LibraryPage({
   }
 
   // New items inherit the current category if we're viewing one — AI only classifies
-  // items added from "All Items" where there's no obvious category yet.
+  // items added from "Home" where there's no obvious category yet.
   const submitNewLine = () => {
     const trimmed = newLineValue.trim()
     if (trimmed && onAddItem) {
@@ -456,12 +510,42 @@ export function LibraryPage({
     else { onDone(link.id) }
   }
 
-  const submitNewCategory = () => { const t = newCatName.trim(); if (t) onAddCategory(t); setNewCatName(''); setAddingCat(false) }
-  const startEditCat = (cat: string) => { setEditingCat(cat); setEditingCatValue(cat) }
+  const submitNewCategory = () => {
+    const t = newCatName.trim()
+    const d = newCatDescription.trim()
+    if (t) {
+      onAddCategory(t, d)
+      setCategoryDescriptions(prev => ({ ...prev, [t]: d }))
+    }
+    setNewCatName(''); setNewCatDescription(''); setAddingCat(false)
+  }
+  const startEditCat = (cat: string) => {
+    setEditingCat(cat)
+    setEditingCatValue(cat)
+    setEditingCatDescription(categoryDescriptions[cat] ?? '')
+  }
   const submitEditCat = () => {
     const t = editingCatValue.trim()
-    if (t && t !== editingCat) { links.forEach(l => { if (l.category === editingCat) onCategoryChange(l.id, t) }); onAddCategory(t); if (activeView === `cat:${editingCat}`) onNavigate(`cat:${t}`) }
-    setEditingCat(null); setEditingCatValue('')
+    const d = editingCatDescription.trim()
+    if (t) {
+      if (t !== editingCat) {
+        links.forEach(l => { if (l.category === editingCat) onCategoryChange(l.id, t) })
+        onAddCategory(t, d)
+        if (activeView === `cat:${editingCat}`) onNavigate(`cat:${t}`)
+        setCategoryDescriptions(prev => {
+          const next = { ...prev }
+          if (editingCat) delete next[editingCat]
+          next[t] = d
+          return next
+        })
+      } else {
+        // Same name, description-only edit — persist directly without going
+        // through onAddCategory (which would trigger the sidebar add path).
+        saveCategoryDescription(t, d)
+        setCategoryDescriptions(prev => ({ ...prev, [t]: d }))
+      }
+    }
+    setEditingCat(null); setEditingCatValue(''); setEditingCatDescription('')
   }
   const submitInlineCat = (itemId: string) => {
     const t = inlineCatValue.trim()
@@ -478,16 +562,16 @@ export function LibraryPage({
     return (
       <div style={{ display: 'flex', height: '100vh', background: '#fafaf9', alignItems: 'center', justifyContent: 'center' }}>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', textAlign: 'center', padding: '40px', maxWidth: 500 }}>
-          <span style={{ fontSize: 44, fontWeight: 600, color: '#1a1a1a', fontFamily: "'Fraunces', serif", letterSpacing: '-1.5px', marginBottom: 10 }}>
-            Later<span style={{ color: '#a10808' }}>.</span>
+          <span style={{ fontSize: 44, fontWeight: 900, color: '#1a1a1a', fontFamily: "'Playfair Display', serif", letterSpacing: '-1.5px', marginBottom: 10 }}>
+            Later<span style={{ color: '#2d8a4e' }}>.</span>
           </span>
           <span style={{ fontSize: 16, color: '#aaa', marginBottom: 56 }}>Save anything. Find it when it matters.</span>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 28, textAlign: 'left', width: '100%', marginBottom: 56 }}>
             <div style={{ display: 'flex', alignItems: 'flex-start', gap: 16 }}>
-              <div style={{ flexShrink: 0, width: 80, textAlign: 'center', fontSize: 12, fontWeight: 600, color: '#666', background: '#f0f0ec', border: '1px solid #e0e0dc', borderRadius: 7, padding: '7px 8px' }}>⌘ ⇧ L</div>
+              <div style={{ flexShrink: 0, width: 80, textAlign: 'center', fontSize: 12, fontWeight: 600, color: '#666', background: '#f0f0ec', border: '1px solid #e0e0dc', borderRadius: 7, padding: '7px 8px' }}>⌘ K</div>
               <div>
                 <div style={{ fontSize: 15, fontWeight: 500, color: '#1a1a1a', marginBottom: 3 }}>Quick save from anywhere</div>
-                <div style={{ fontSize: 13, color: '#999', lineHeight: '1.5' }}>Links, notes, tasks — press ⌘⇧L from any app on your Mac.</div>
+                <div style={{ fontSize: 13, color: '#999', lineHeight: '1.5' }}>Links, notes, tasks — press ⌘K from any app on your Mac.</div>
               </div>
             </div>
             <div style={{ display: 'flex', alignItems: 'flex-start', gap: 16 }}>
@@ -513,27 +597,93 @@ export function LibraryPage({
 
   const sidebar = (
     <div style={{ width: 210, flexShrink: 0, background: '#f5f4f1', borderRight: '1px solid #e8e8e4', display: 'flex', flexDirection: 'column', padding: '20px 10px', overflowY: 'auto' }}>
-      <div style={{ padding: '4px 12px', marginBottom: 24 }}>
-        <span style={{ fontSize: 18, fontWeight: 600, color: '#1a1a1a', fontFamily: "'Fraunces', serif", letterSpacing: '-0.2px' }}>Later<span style={{ color: '#a10808' }}>.</span></span>
+      <div style={{ padding: '4px 12px', marginBottom: 20 }}>
+        <span style={{ fontSize: 22, fontWeight: 900, color: '#1a1a1a', fontFamily: "'Playfair Display', serif", letterSpacing: '-0.3px' }}>Later<span style={{ color: '#2d8a4e' }}>.</span></span>
       </div>
-      <button onClick={() => { onNavigate('library'); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 12px', fontSize: 14, marginBottom: 16, fontWeight: activeView === 'library' ? 600 : 400, color: '#1a1a1a', background: activeView === 'library' ? '#eeede9' : 'none', border: 'none', borderRadius: 6, cursor: 'pointer', fontFamily: 'inherit' }}>All Items</button>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 12px', marginBottom: 4 }}>
-        <span style={{ fontSize: 11, fontWeight: 600, color: '#bbb', letterSpacing: '0.06em', textTransform: 'uppercase' }}>Categories</span>
+      <button onClick={() => { onNavigate('library'); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '9px 12px', fontSize: 17, marginBottom: 16, fontWeight: activeView === 'library' ? 600 : 500, color: '#1a1a1a', background: activeView === 'library' ? '#eeede9' : 'none', border: 'none', borderRadius: 6, cursor: 'pointer', fontFamily: "'Fraunces', serif" }}>Home</button>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 12px', marginBottom: 12 }}>
+        <span style={{ fontSize: 15, fontWeight: 600, color: '#9a9a94', fontFamily: "'Fraunces', serif" }}>Categories</span>
         <button onClick={() => setAddingCat(true)} style={{ width: 18, height: 18, borderRadius: 4, border: '1px solid #d8d8d4', background: 'none', cursor: 'pointer', fontSize: 14, color: '#aaa', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'inherit', padding: 0 }}>+</button>
       </div>
       {categories.map((cat) => {
         const active = activeView === `cat:${cat}`
         const count = categoryCounts[cat] || 0
-        if (editingCat === cat) return (<div key={cat} style={{ padding: '2px 4px' }}><input autoFocus value={editingCatValue} onChange={e => setEditingCatValue(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') submitEditCat(); if (e.key === 'Escape') { setEditingCat(null); setEditingCatValue('') } }} onBlur={submitEditCat} style={{ width: '100%', fontSize: 14, padding: '5px 8px', border: '1px solid #c8c8c4', borderRadius: 6, outline: 'none', background: '#fff', color: '#1a1a1a', fontFamily: 'inherit' }} /></div>)
-        return (<div key={cat} style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-          <button onClick={() => { onNavigate(`cat:${cat}`); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }} onDoubleClick={() => startEditCat(cat)} style={{ flex: 1, textAlign: 'left', padding: '7px 12px', fontSize: 14, fontWeight: active ? 600 : 400, color: '#1a1a1a', background: active ? '#eeede9' : 'none', border: 'none', borderRadius: 6, cursor: 'pointer', fontFamily: 'inherit', display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+        const catDescription = categoryDescriptions[cat]
+        if (editingCat === cat) {
+          return (
+            <div key={cat} style={{ padding: '4px 4px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <input
+                autoFocus
+                value={editingCatValue}
+                onChange={e => setEditingCatValue(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') submitEditCat()
+                  if (e.key === 'Escape') { setEditingCat(null); setEditingCatValue(''); setEditingCatDescription('') }
+                }}
+                placeholder="Category name…"
+                style={{ width: '100%', fontSize: 14, padding: '5px 8px', border: '1px solid #c8c8c4', borderRadius: 6, outline: 'none', background: '#fff', color: '#1a1a1a', fontFamily: 'inherit' }}
+              />
+              <textarea
+                value={editingCatDescription}
+                onChange={e => setEditingCatDescription(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submitEditCat()
+                  if (e.key === 'Escape') { setEditingCat(null); setEditingCatValue(''); setEditingCatDescription('') }
+                }}
+                onBlur={submitEditCat}
+                placeholder="What belongs here? (optional)"
+                rows={2}
+                style={{ width: '100%', fontSize: 12, padding: '5px 8px', border: '1px solid #d8d8d4', borderRadius: 6, outline: 'none', background: '#fff', color: '#555', fontFamily: 'inherit', resize: 'none', lineHeight: '1.35' }}
+              />
+            </div>
+          )
+        }
+        const isCatHovered = hoveredCat === cat
+        return (<div
+          key={cat}
+          style={{ display: 'flex', alignItems: 'center', gap: 2, position: 'relative' }}
+          onMouseEnter={() => setHoveredCat(cat)}
+          onMouseLeave={() => setHoveredCat(null)}
+        >
+          <button
+            onClick={() => { onNavigate(`cat:${cat}`); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }}
+            onDoubleClick={() => startEditCat(cat)}
+            title={catDescription ? `${cat} — ${catDescription}\n\nDouble-click to edit` : `${cat}\n\nDouble-click to add a description`}
+            style={{ flex: 1, textAlign: 'left', padding: '6px 12px', fontSize: 13, fontWeight: active ? 600 : 400, color: '#1a1a1a', background: active ? '#eeede9' : 'none', border: 'none', borderRadius: 6, cursor: 'pointer', fontFamily: "'Fraunces', serif", display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}
+          >
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>{cat}</span>
             {count > 0 && <span style={{ color: '#aaa', fontWeight: 400, fontSize: 13, flexShrink: 0 }}>{count}</span>}
           </button>
-          {onDeleteCategory && <button onClick={() => onDeleteCategory(cat)} style={{ width: 20, height: 20, borderRadius: 4, border: 'none', background: 'none', cursor: 'pointer', color: '#ccc', fontSize: 14, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0, flexShrink: 0 }} onMouseEnter={e => { e.currentTarget.style.color = '#e05c5c' }} onMouseLeave={e => { e.currentTarget.style.color = '#ccc' }}>×</button>}
+          {onDeleteCategory && isCatHovered && <button onClick={() => onDeleteCategory(cat)} title="Delete category" style={{ width: 20, height: 20, borderRadius: 4, border: 'none', background: 'none', cursor: 'pointer', color: '#ccc', fontSize: 14, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0, flexShrink: 0 }} onMouseEnter={e => { e.currentTarget.style.color = '#e05c5c' }} onMouseLeave={e => { e.currentTarget.style.color = '#ccc' }}>×</button>}
         </div>)
       })}
-      {addingCat && <div style={{ padding: '4px 4px' }}><input autoFocus value={newCatName} onChange={e => setNewCatName(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') submitNewCategory(); if (e.key === 'Escape') { setAddingCat(false); setNewCatName('') } }} onBlur={submitNewCategory} placeholder="Category name…" style={{ width: '100%', fontSize: 13, padding: '5px 8px', border: '1px solid #d8d8d4', borderRadius: 6, outline: 'none', background: '#fff', color: '#1a1a1a', fontFamily: 'inherit' }} /></div>}
+      {addingCat && (
+        <div style={{ padding: '4px 4px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <input
+            autoFocus
+            value={newCatName}
+            onChange={e => setNewCatName(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') submitNewCategory()
+              if (e.key === 'Escape') { setAddingCat(false); setNewCatName(''); setNewCatDescription('') }
+            }}
+            placeholder="Category name…"
+            style={{ width: '100%', fontSize: 13, padding: '5px 8px', border: '1px solid #d8d8d4', borderRadius: 6, outline: 'none', background: '#fff', color: '#1a1a1a', fontFamily: 'inherit' }}
+          />
+          <textarea
+            value={newCatDescription}
+            onChange={e => setNewCatDescription(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submitNewCategory()
+              if (e.key === 'Escape') { setAddingCat(false); setNewCatName(''); setNewCatDescription('') }
+            }}
+            onBlur={submitNewCategory}
+            placeholder="What belongs here? (optional)"
+            rows={2}
+            style={{ width: '100%', fontSize: 12, padding: '5px 8px', border: '1px solid #d8d8d4', borderRadius: 6, outline: 'none', background: '#fff', color: '#555', fontFamily: 'inherit', resize: 'none', lineHeight: '1.35' }}
+          />
+        </div>
+      )}
     </div>
   )
 
@@ -557,13 +707,11 @@ export function LibraryPage({
                 onMouseLeave={() => { if (!dropdownOpen) setHoveredItemId(null) }}
                 style={{
                   display: 'flex', alignItems: 'center', gap: 10,
-                  padding: '4px 8px',
-                  // Flat rectangle, no radius — adjacent selected rows merge into
-                  // one continuous warm-yellow block (Apple Notes selection style).
-                  borderRadius: isInSelection ? 0 : 6,
-                  background: isInSelection
-                    ? '#FAF3C0'
-                    : (isHovered || dropdownOpen ? '#f2f1ed' : 'transparent'),
+                  // Vertical padding removed so adjacent selected rows' inner
+                  // cream blocks touch and merge into one continuous fill.
+                  padding: '0 8px',
+                  borderRadius: 6,
+                  background: 'transparent',
                   transition: 'background 0.1s',
                   opacity: link.is_done ? 0.45 : 1,
                 }}
@@ -575,7 +723,12 @@ export function LibraryPage({
                 >
                   {link.is_done && <span style={{ color: '#fff', fontSize: 9 }}>✓</span>}
                 </button>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0, position: 'relative' }}>
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0, position: 'relative',
+                  padding: '3px 8px',
+                  background: isInSelection ? '#f3dcaa' : 'transparent',
+                  transition: 'background 0.1s',
+                }}>
                   <input
                     ref={el => { inputRefs.current[link.id] = el }}
                     value={value}
@@ -596,7 +749,57 @@ export function LibraryPage({
                       style={{ fontSize: 11, color: '#bbb', flexShrink: 0, background: 'none', border: 'none', cursor: 'pointer', padding: '2px 4px', fontFamily: 'inherit' }}
                     >↗</button>
                   )}
-                  {(isHovered || dropdownOpen) && !hideCategoryUI && (
+                  {link.pending_suggestion && !hideCategoryUI && (
+                    <PendingSuggestionChip
+                      suggestion={link.pending_suggestion}
+                      onAccept={() => onAcceptSuggestion?.(link.id)}
+                      onReject={() => onRejectSuggestion?.(link.id)}
+                    />
+                  )}
+                  {/* Reminder — always visible when set, hover-only affordance
+                      when unset. Small clock icon opens the popover. */}
+                  {!hideCategoryUI && link.remind_at && (
+                    <button
+                      onMouseDown={e => e.stopPropagation()}
+                      onClick={e => { e.stopPropagation(); setReminderOpenId(reminderOpenId === link.id ? null : link.id) }}
+                      title={`Reminder set: ${new Date(link.remind_at).toLocaleString()} — click to change or clear`}
+                      style={{ fontSize: 11, color: '#2d8a4e', background: '#eef5f0', border: '1px solid #cfe0d5', borderRadius: 999, padding: '2px 9px 2px 8px', cursor: 'pointer', fontFamily: 'inherit', display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0, position: 'relative' }}
+                    >
+                      <BellIcon />
+                      <span>{formatReminderLabel(link.remind_at)}</span>
+                      {reminderOpenId === link.id && onSetReminder && onClearReminder && (
+                        <ReminderPopover
+                          currentRemindAt={link.remind_at}
+                          onSet={iso => onSetReminder(link.id, iso)}
+                          onClear={() => onClearReminder(link.id)}
+                          onClose={() => setReminderOpenId(null)}
+                        />
+                      )}
+                    </button>
+                  )}
+                  {!hideCategoryUI && !link.remind_at && (isHovered || reminderOpenId === link.id) && (
+                    <div style={{ position: 'relative', flexShrink: 0 }}>
+                      <button
+                        onMouseDown={e => e.stopPropagation()}
+                        onClick={e => { e.stopPropagation(); setReminderOpenId(reminderOpenId === link.id ? null : link.id) }}
+                        title="Add reminder"
+                        style={{ color: '#bbb', background: 'transparent', border: 'none', cursor: 'pointer', padding: '3px 5px', fontFamily: 'inherit', display: 'flex', alignItems: 'center', borderRadius: 4, transition: 'color 0.12s, background 0.12s' }}
+                        onMouseEnter={e => { e.currentTarget.style.color = '#666'; e.currentTarget.style.background = '#f2f1ed' }}
+                        onMouseLeave={e => { e.currentTarget.style.color = '#bbb'; e.currentTarget.style.background = 'transparent' }}
+                      >
+                        <BellIcon />
+                      </button>
+                      {reminderOpenId === link.id && onSetReminder && onClearReminder && (
+                        <ReminderPopover
+                          currentRemindAt={link.remind_at}
+                          onSet={iso => onSetReminder(link.id, iso)}
+                          onClear={() => onClearReminder(link.id)}
+                          onClose={() => setReminderOpenId(null)}
+                        />
+                      )}
+                    </div>
+                  )}
+                  {!link.pending_suggestion && (isHovered || dropdownOpen) && !hideCategoryUI && (
                     <div style={{ position: 'relative', flexShrink: 0 }}>
                       <button
                         onMouseDown={e => e.stopPropagation()}
@@ -677,10 +880,63 @@ export function LibraryPage({
   )
 
   return (
-    <div style={{ display: 'flex', height: '100vh', background: '#fafaf9', overflow: 'hidden' }}>
+    <div style={{ display: 'flex', height: '100vh', background: '#fafaf9', overflow: 'hidden', position: 'relative' }}>
       {sidebar}
       {listPanel}
       {detailPanel}
+      {showCmdKHint && <CmdKHint />}
+    </div>
+  )
+}
+
+// Subtle, always-on hint at the bottom-right of the vault window. Fades out
+// naturally once the user has pressed Cmd+K enough times (managed via
+// lib/hints.ts). No dismiss button — this is an ambient reminder, not a
+// modal, so the "dismiss" is just using the shortcut a few times.
+function CmdKHint() {
+  return (
+    <div
+      aria-hidden="true"
+      style={{
+        position: 'absolute',
+        bottom: 14,
+        right: 18,
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 8,
+        padding: '6px 12px',
+        background: 'rgba(255, 255, 255, 0.85)',
+        border: '1px solid #eae8e2',
+        borderRadius: 999,
+        fontSize: 12,
+        color: '#8a8a86',
+        fontFamily: 'inherit',
+        pointerEvents: 'none',
+        boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
+        backdropFilter: 'blur(6px)',
+        WebkitBackdropFilter: 'blur(6px)',
+        userSelect: 'none',
+        zIndex: 20,
+      }}
+    >
+      <span>Save from anywhere</span>
+      <kbd
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 2,
+          padding: '2px 6px',
+          background: '#f5f4f1',
+          border: '1px solid #e2e0da',
+          borderRadius: 4,
+          fontSize: 11,
+          fontFamily: 'inherit',
+          fontWeight: 600,
+          color: '#555',
+        }}
+      >
+        ⌘ K
+      </kbd>
     </div>
   )
 }

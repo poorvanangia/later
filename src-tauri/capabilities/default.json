@@ -1,11 +1,15 @@
 {
   "identifier": "default",
   "description": "Capability for all Later windows — spotlight, popup, and library all need to invoke Rust commands.",
-  "windows": ["main", "popup", "library"],
+  "windows": ["main", "popup", "library", "reminder_*"],
   "permissions": [
     "core:default",
     "shell:allow-open",
     "updater:default",
-    "process:default"
+    "process:default",
+    "notification:default",
+    "notification:allow-notify",
+    "notification:allow-request-permission",
+    "notification:allow-permission-state"
   ]
 }

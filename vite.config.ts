@@ -10,6 +10,7 @@ export default defineConfig({
       input: {
         main: resolve(__dirname, 'index.html'),
         popup: resolve(__dirname, 'popup.html'),
+        reminder: resolve(__dirname, 'reminder.html'),
       }
     }
   }

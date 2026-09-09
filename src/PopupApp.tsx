@@ -1,8 +1,25 @@
 import { useState, useEffect } from 'react'
 import { TrayPopup } from './components/TrayPopup'
 import { Onboarding } from './components/Onboarding'
+import {
+  loadCategoryDescriptions,
+  saveCategoryDescription,
+  loadPendingNewNames,
+  enqueueSuggestNew,
+  acceptPendingNew,
+  rejectPendingNewOnItem,
+  pruneQueue,
+  logRejection,
+  type PendingSuggestion,
+  type ClassifyResponse,
+} from './lib/classifier'
+import { loadUserProfileText } from './lib/profile'
 
 const SYNC_EVENT = 'later://state-changed'
+
+// See App.tsx for rationale — serialize classifications so pending_new_names
+// converge across rapid entry.
+let classifyChain: Promise<void> = Promise.resolve()
 
 async function broadcastChange() {
   try {
@@ -31,6 +48,7 @@ export type LinkRow = {
   ai_processed: boolean
   created_at: string
   item_type: ItemType
+  pending_suggestion?: PendingSuggestion | null
 }
 
 function loadLinks(): LinkRow[] {
@@ -166,6 +184,13 @@ export function PopupApp() {
   const aiCategories = [...new Set(links.map(l => l.category).filter(Boolean) as string[])]
   const allCategories = [...new Set([...categories, ...aiCategories])]
 
+  // Prune pending-new-category queue on mount so deleted items don't keep a
+  // stale suggestion alive.
+  useEffect(() => {
+    pruneQueue(new Set(links.map(l => l.id)))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // Sync when other windows update localStorage. Storage events are flaky in
   // Tauri WKWebView so we also listen for a Tauri event.
   useEffect(() => {
@@ -203,34 +228,180 @@ export function PopupApp() {
     } catch { }
   }
 
-  const classifyItem = async (id: string, text: string) => {
+  const classifyItem = (id: string, text: string): Promise<void> => {
+    classifyChain = classifyChain.then(() => classifyItemImpl(id, text)).catch(() => {})
+    return classifyChain
+  }
+
+  const applyLinksHelper = (fn: (l: LinkRow) => LinkRow) => setLinks(prev => {
+    const updated = prev.map(fn)
+    saveLinks(updated)
+    return updated
+  })
+
+  const classifyItemImpl = async (id: string, text: string) => {
     console.log('[later/popup] classifyItem start', { id, text: text.slice(0, 60) })
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      const raw = await invoke<string>('classify_item', { text, existingCategories: allCategories })
-      console.log('[later/popup] classifyItem response', { id, raw })
-      const cleaned = (raw || '').trim().replace(/^["']|["']$/g, '').replace(/[.,;:!?]+$/, '').trim()
-      const generic = /^(other|misc|miscellaneous|uncategori[sz]ed|general|unknown)$/i
-      if (!cleaned || generic.test(cleaned)) {
-        console.warn('[later/popup] classifyItem: empty/generic response — backend likely errored (see Rust stderr)')
-        setLinks((prev) => {
-          const updated = prev.map((l) => l.id === id ? { ...l, ai_processed: true } : l)
-          saveLinks(updated)
-          return updated
-        })
+      const result = await invoke<ClassifyResponse>('classify_item', {
+        text,
+        existingCategories: categories,
+        categoryDescriptions: loadCategoryDescriptions(),
+        pendingNewNames: loadPendingNewNames(),
+        userProfile: loadUserProfileText(),
+      })
+      console.log('[later/popup] classifyItem response', { id, result })
+
+      if (result.decision === 'assign' && result.category) {
+        applyLinksHelper(l => l.id === id ? { ...l, category: result.category, ai_processed: true, pending_suggestion: null } : l)
         return
       }
-      setLinks((prev) => {
-        const updated = prev.map((l) => l.id === id ? { ...l, category: cleaned, ai_processed: true } : l)
+
+      // Non-confident → placeholder chip + reasoning second pass.
+      if ((result.decision === 'suggest_existing' || result.decision === 'suggest_new') && result.category) {
+        const fallbackKind = result.decision === 'suggest_existing' ? 'existing' as const : 'new' as const
+        applyLinksHelper(l => l.id === id
+          ? {
+              ...l,
+              category: null,
+              ai_processed: true,
+              pending_suggestion: {
+                kind: 'reasoning',
+                fallbackCategory: result.category,
+                fallbackKind,
+                fallbackDescription: result.description,
+              },
+            }
+          : l)
+        reasoningReclassify(id, text, {
+          category: result.category,
+          kind: fallbackKind,
+          description: result.description,
+          reason: result.reason,
+        }).catch(err => console.error('[later/popup] reasoning pass threw', err))
+        return
+      }
+
+      // decision === 'none'
+      applyLinksHelper(l => l.id === id ? { ...l, ai_processed: true } : l)
+    } catch (err) {
+      console.error('[later/popup] classifyItem invoke threw', err)
+      setLinks(prev => {
+        const updated = prev.map(l => l.id === id ? { ...l, ai_processed: true } : l)
         saveLinks(updated)
         return updated
       })
-      if (!allCategories.includes(cleaned)) {
-        handleAddCategory(cleaned)
-      }
-    } catch (err) {
-      console.error('[later/popup] classifyItem invoke threw', err)
     }
+  }
+
+  const applyClassifyVerdict = (originId: string, result: ClassifyResponse) => {
+    if (result.decision === 'assign' && result.category) {
+      applyLinksHelper(l => l.id === originId ? { ...l, category: result.category, pending_suggestion: null } : l)
+      return
+    }
+    if (result.decision === 'suggest_existing' && result.category) {
+      applyLinksHelper(l => l.id === originId
+        ? { ...l, category: null, pending_suggestion: { kind: 'existing', category: result.category, reason: result.reason } }
+        : l)
+      return
+    }
+    if (result.decision === 'suggest_new' && result.category) {
+      const { surfaceNow, linkIdsToUpdate, description } = enqueueSuggestNew(originId, result.category, result.description)
+      const idSet = new Set([originId, ...linkIdsToUpdate])
+      applyLinksHelper(l => {
+        if (l.id === originId) {
+          return {
+            ...l,
+            pending_suggestion: surfaceNow ? { kind: 'new', category: result.category, description, reason: result.reason } : l.pending_suggestion,
+          }
+        }
+        if (surfaceNow && idSet.has(l.id)) {
+          return { ...l, pending_suggestion: { kind: 'new', category: result.category, description, reason: result.reason } }
+        }
+        return l
+      })
+      return
+    }
+    applyLinksHelper(l => l.id === originId ? { ...l, pending_suggestion: null } : l)
+  }
+
+  const reasoningReclassify = async (
+    id: string,
+    text: string,
+    fallback: { category: string; kind: 'existing' | 'new'; description: string; reason: string },
+  ): Promise<void> => {
+    console.log('[later/popup] reclassify start', { id, text: text.slice(0, 60) })
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      const result = await invoke<ClassifyResponse>('reclassify_item', {
+        text,
+        existingCategories: categories,
+        categoryDescriptions: loadCategoryDescriptions(),
+        pendingNewNames: loadPendingNewNames(),
+        userProfile: loadUserProfileText(),
+      })
+      console.log('[later/popup] reclassify response', { id, result })
+      if (result.decision === 'none') {
+        applyClassifyVerdict(id, {
+          decision: fallback.kind === 'existing' ? 'suggest_existing' : 'suggest_new',
+          category: fallback.category,
+          description: fallback.description,
+          reason: fallback.reason,
+        })
+        return
+      }
+      applyClassifyVerdict(id, result)
+    } catch (err) {
+      console.error('[later/popup] reclassify_item invoke threw', err)
+      applyClassifyVerdict(id, {
+        decision: fallback.kind === 'existing' ? 'suggest_existing' : 'suggest_new',
+        category: fallback.category,
+        description: fallback.description,
+        reason: fallback.reason,
+      })
+    }
+  }
+
+  const handleAcceptSuggestion = (id: string) => {
+    const link = links.find(l => l.id === id)
+    if (!link?.pending_suggestion) return
+    const sugg = link.pending_suggestion
+    if (sugg.kind === 'reasoning') return
+    const applyLinks = (fn: (l: LinkRow) => LinkRow) => setLinks(prev => {
+      const updated = prev.map(fn); saveLinks(updated); return updated
+    })
+    if (sugg.kind === 'existing') {
+      applyLinks(l => l.id === id ? { ...l, category: sugg.category, pending_suggestion: null } : l)
+      return
+    }
+    const { linkIds, description } = acceptPendingNew(sugg.category)
+    const idSet = new Set(linkIds.length > 0 ? linkIds : [id])
+    if (!categories.includes(sugg.category)) {
+      const updatedCats = [...new Set([...categories, sugg.category])]
+      setCategories(updatedCats)
+      saveCategories(updatedCats)
+      saveCategoryDescription(sugg.category, description || sugg.description)
+    }
+    applyLinks(l => idSet.has(l.id) ? { ...l, category: sugg.category, pending_suggestion: null } : l)
+  }
+
+  const handleRejectSuggestion = (id: string) => {
+    const link = links.find(l => l.id === id)
+    if (!link?.pending_suggestion) return
+    const sugg = link.pending_suggestion
+    if (sugg.kind === 'reasoning') return
+    logRejection({
+      text: link.title || link.note || link.url || '',
+      rejected_category: sugg.category,
+      kind: sugg.kind,
+      timestamp: new Date().toISOString(),
+    })
+    if (sugg.kind === 'new') rejectPendingNewOnItem(id, sugg.category)
+    setLinks(prev => {
+      const updated = prev.map(l => l.id === id ? { ...l, pending_suggestion: null } : l)
+      saveLinks(updated)
+      return updated
+    })
   }
 
   const titleLongItem = async (id: string, text: string) => {
@@ -302,17 +473,21 @@ export function PopupApp() {
 
   const handleCategoryChange = (id: string, category: string) => {
     setLinks((prev) => {
-      const updated = prev.map((l) => l.id === id ? { ...l, category } : l)
+      const updated = prev.map((l) => l.id === id ? { ...l, category, pending_suggestion: null } : l)
       saveLinks(updated)
       return updated
     })
-    if (!allCategories.includes(category)) handleAddCategory(category)
+    // Explicit user pick from the item's menu — user is choosing to create a
+    // new category via the inline "+ New" affordance. Only sidebar entries
+    // count as user categories, so this is the sanctioned path to create one.
+    if (!categories.includes(category)) handleAddCategory(category)
   }
 
-  const handleAddCategory = (name: string) => {
+  const handleAddCategory = (name: string, description?: string) => {
     const updated = [...new Set([...categories, name])]
     setCategories(updated)
     saveCategories(updated)
+    if (description !== undefined) saveCategoryDescription(name, description)
   }
 
   return (
@@ -324,6 +499,8 @@ export function PopupApp() {
         onDone={handleDone}
         onCategoryChange={handleCategoryChange}
         onAddCategory={handleAddCategory}
+        onAcceptSuggestion={handleAcceptSuggestion}
+        onRejectSuggestion={handleRejectSuggestion}
         isSignedIn={true}
         onSignIn={() => {}}
       />

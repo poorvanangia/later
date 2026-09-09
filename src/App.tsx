@@ -1,6 +1,22 @@
 import { useState, useEffect } from 'react'
 import { LibraryPage } from './components/LibraryPage'
 import { SpotlightBar } from './components/SpotlightBar'
+import { Onboarding } from './components/Onboarding'
+import {
+  loadCategoryDescriptions,
+  saveCategoryDescription,
+  deleteCategoryDescription,
+  loadPendingNewNames,
+  enqueueSuggestNew,
+  acceptPendingNew,
+  rejectPendingNewOnItem,
+  pruneQueue,
+  logRejection,
+  type PendingSuggestion,
+  type ClassifyResponse,
+} from './lib/classifier'
+import { loadUserProfileText } from './lib/profile'
+import { scheduleReminderNative, cancelReminderNative } from './lib/reminders'
 
 const SYNC_EVENT = 'later://state-changed'
 
@@ -17,6 +33,12 @@ async function broadcastChange() {
 
 const WINDOW_LABEL = (window as any).__TAURI_INTERNALS__?.metadata?.currentWindow?.label ?? ''
 const IS_SPOTLIGHT = WINDOW_LABEL === 'main'
+
+// Serialize classify_item calls so each one sees the pending queue populated
+// by the previous. Rapid entry of similar items (three purchases in a row)
+// would otherwise fire three parallel classifications, all reading an empty
+// pending queue and independently proposing different new-category names.
+let classifyChain: Promise<void> = Promise.resolve()
 
 // Legacy seed names from v0.1.7 and earlier — never a design goal, just
 // pre-population that leaked through onto every new install. Kept only for the
@@ -41,6 +63,13 @@ export type LinkRow = {
   ai_processed: boolean
   created_at: string
   item_type: ItemType
+  // Present when the classifier was unsure or proposed a new category. The
+  // item's `category` field stays null (uncategorized) until the user taps ✓
+  // on the chip. Rejection clears this and logs the rejection.
+  pending_suggestion?: PendingSuggestion | null
+  // Optional one-time reminder. ISO datetime. When set, the Rust side has
+  // a tokio task waiting to fire a macOS notification at this time.
+  remind_at?: string | null
 }
 
 function loadLinks(): LinkRow[] {
@@ -92,6 +121,12 @@ export default function App() {
   const [search, setSearch] = useState('')
   const [categories, setCategories] = useState<string[]>(loadCategories)
   const [, setUndoStack] = useState<Snapshot[]>([])
+  // Onboarding was previously mounted in the (now-retired) popup window. Now
+  // that the vault is the first thing users see, it lives here — shown as an
+  // overlay when the completion marker is missing.
+  const [showOnboarding, setShowOnboarding] = useState(() => {
+    try { return WINDOW_LABEL === 'library' && !localStorage.getItem('later:onboardingComplete') } catch { return false }
+  })
 
   const aiCategories = [...new Set(links.map(l => l.category).filter(Boolean) as string[])]
   const allCategories = [...new Set([...categories, ...aiCategories])]
@@ -121,6 +156,14 @@ export default function App() {
       return updated
     })
   }
+
+  // Prune the pending-new-category queue on mount so deleted items don't
+  // keep a suggestion alive. Runs once per window mount.
+  useEffect(() => {
+    pruneQueue(new Set(links.map(l => l.id)))
+    // Only on first mount — not on every links change (would thrash localStorage).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Reload from localStorage on storage event (other browser tabs) OR Tauri
   // event (other Tauri windows in this same app).
@@ -208,39 +251,261 @@ export default function App() {
     } catch { }
   }
 
-  const classifyItem = async (id: string, text: string) => {
+  const classifyItem = (id: string, text: string): Promise<void> => {
+    classifyChain = classifyChain.then(() => classifyItemImpl(id, text)).catch(() => {})
+    return classifyChain
+  }
+
+  const classifyItemImpl = async (id: string, text: string) => {
     console.log('[later] classifyItem start', { id, text: text.slice(0, 60) })
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      const raw = await invoke<string>('classify_item', { text, existingCategories: allCategories })
-      console.log('[later] classifyItem response', { id, raw })
-      const cleaned = (raw || '').trim().replace(/^["']|["']$/g, '').replace(/[.,;:!?]+$/, '').trim()
-      const generic = /^(other|misc|miscellaneous|uncategori[sz]ed|general|unknown)$/i
-      if (!cleaned || generic.test(cleaned)) {
-        // Empty response = backend silently failed (likely API error). Mark as
-        // processed but leave category null; surface as "AI failed" in UI.
-        console.warn('[later] classifyItem: empty or generic response — backend likely errored (see Rust stderr)')
-        applyBackgroundUpdate(prev => prev.map(l => l.id === id ? { ...l, ai_processed: true } : l))
+      // Pass ONLY user-defined categories (sidebar entries) — never the union
+      // with AI-assigned labels, which would let past hallucinations become
+      // the taxonomy for future items.
+      const result = await invoke<ClassifyResponse>('classify_item', {
+        text,
+        existingCategories: categories,
+        categoryDescriptions: loadCategoryDescriptions(),
+        pendingNewNames: loadPendingNewNames(),
+        userProfile: loadUserProfileText(),
+      })
+      console.log('[later] classifyItem response', { id, result })
+
+      if (result.decision === 'assign' && result.category) {
+        applyBackgroundUpdate(prev => prev.map(l =>
+          l.id === id ? { ...l, category: result.category, ai_processed: true, pending_suggestion: null } : l
+        ))
         return
       }
-      applyBackgroundUpdate(prev => prev.map(l => l.id === id ? { ...l, category: cleaned, ai_processed: true } : l))
-      if (!allCategories.includes(cleaned)) handleAddCategory(cleaned)
+
+      // Non-confident Haiku verdict → surface a "Thinking…" chip, then kick
+      // off the reasoning pass. Reasoning result replaces this via the same
+      // decision handlers. Only real content flows through reasoning;
+      // empty/gibberish (`none`) is dropped as before.
+      if ((result.decision === 'suggest_existing' || result.decision === 'suggest_new') && result.category) {
+        const fallbackKind = result.decision === 'suggest_existing' ? 'existing' as const : 'new' as const
+        applyBackgroundUpdate(prev => prev.map(l =>
+          l.id === id
+            ? {
+                ...l,
+                category: null,
+                ai_processed: true,
+                pending_suggestion: {
+                  kind: 'reasoning',
+                  fallbackCategory: result.category,
+                  fallbackKind,
+                  fallbackDescription: result.description,
+                },
+              }
+            : l
+        ))
+        // Fire-and-forget: non-blocking so the row is interactive immediately.
+        reasoningReclassify(id, text, {
+          category: result.category,
+          kind: fallbackKind,
+          description: result.description,
+          reason: result.reason,
+        }).catch(err => console.error('[later] reasoning pass threw', err))
+        return
+      }
+
+      // decision === 'none' — no category, no chip. Just mark processed.
+      applyBackgroundUpdate(prev => prev.map(l => l.id === id ? { ...l, ai_processed: true } : l))
     } catch (err) {
       console.error('[later] classifyItem invoke threw', err)
       applyBackgroundUpdate(prev => prev.map(l => l.id === id ? { ...l, ai_processed: true } : l))
     }
   }
 
+  // Apply a classifier verdict to an item's pending_suggestion state. Shared
+  // between the first pass and the reasoning second pass. `originId` is the
+  // id whose text was classified; queue-mate ids also get the chip in the
+  // suggest_new case.
+  const applyClassifyVerdict = (originId: string, result: ClassifyResponse) => {
+    if (result.decision === 'assign' && result.category) {
+      applyBackgroundUpdate(prev => prev.map(l =>
+        l.id === originId ? { ...l, category: result.category, pending_suggestion: null } : l
+      ))
+      return
+    }
+    if (result.decision === 'suggest_existing' && result.category) {
+      applyBackgroundUpdate(prev => prev.map(l =>
+        l.id === originId
+          ? { ...l, category: null, pending_suggestion: { kind: 'existing', category: result.category, reason: result.reason } }
+          : l
+      ))
+      return
+    }
+    if (result.decision === 'suggest_new' && result.category) {
+      const { surfaceNow, linkIdsToUpdate, description } = enqueueSuggestNew(originId, result.category, result.description)
+      const idSet = new Set([originId, ...linkIdsToUpdate])
+      applyBackgroundUpdate(prev => prev.map(l => {
+        if (l.id === originId) {
+          return {
+            ...l,
+            pending_suggestion: surfaceNow ? { kind: 'new', category: result.category, description, reason: result.reason } : l.pending_suggestion,
+          }
+        }
+        if (surfaceNow && idSet.has(l.id)) {
+          return { ...l, pending_suggestion: { kind: 'new', category: result.category, description, reason: result.reason } }
+        }
+        return l
+      }))
+      return
+    }
+    // decision === 'none' — clear any placeholder chip so the row shows the
+    // regular Category dropdown, not a stuck "Thinking…" state.
+    applyBackgroundUpdate(prev => prev.map(l =>
+      l.id === originId ? { ...l, pending_suggestion: null } : l
+    ))
+  }
+
+  // Second-pass reclassification via Sonnet 4.6 + extended thinking. Only
+  // called for items Haiku wasn't confident about. Fallback param preserves
+  // Haiku's answer so a failed reasoning call still shows something useful
+  // to the user rather than a phantom Thinking… chip.
+  const reasoningReclassify = async (
+    id: string,
+    text: string,
+    fallback: { category: string; kind: 'existing' | 'new'; description: string; reason: string },
+  ): Promise<void> => {
+    console.log('[later] reclassify start', { id, text: text.slice(0, 60) })
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      const result = await invoke<ClassifyResponse>('reclassify_item', {
+        text,
+        existingCategories: categories,
+        categoryDescriptions: loadCategoryDescriptions(),
+        pendingNewNames: loadPendingNewNames(),
+        userProfile: loadUserProfileText(),
+      })
+      console.log('[later] reclassify response', { id, result })
+      // If reasoning failed (returned "none" as a defensive fallback), keep
+      // Haiku's original guess rather than dropping the item to uncategorized.
+      if (result.decision === 'none') {
+        applyClassifyVerdict(id, {
+          decision: fallback.kind === 'existing' ? 'suggest_existing' : 'suggest_new',
+          category: fallback.category,
+          description: fallback.description,
+          reason: fallback.reason,
+        })
+        return
+      }
+      applyClassifyVerdict(id, result)
+    } catch (err) {
+      console.error('[later] reclassify_item invoke threw', err)
+      // Fall back to Haiku's suggestion so the chip isn't stuck.
+      applyClassifyVerdict(id, {
+        decision: fallback.kind === 'existing' ? 'suggest_existing' : 'suggest_new',
+        category: fallback.category,
+        description: fallback.description,
+        reason: fallback.reason,
+      })
+    }
+  }
+
   const summariseItem = async (id: string, text: string) => {
     try {
       const { invoke } = await import('@tauri-apps/api/core')
-      const summary = await invoke<string>('classify_item', {
-        text: `Summarise this in 6 words or less as a title: ${text.slice(0, 500)}`
-      })
+      const summary = await invoke<string>('generate_title', { text: text.slice(0, 2000) })
       if (summary && summary.length > 0) {
         applyBackgroundUpdate(prev => prev.map(l => l.id === id ? { ...l, title: summary } : l))
       }
     } catch { }
+  }
+
+  const handleAcceptSuggestion = (id: string) => {
+    const link = links.find(l => l.id === id)
+    if (!link?.pending_suggestion) return
+    const sugg = link.pending_suggestion
+    // Reasoning placeholder has no ✓/✗ buttons but guard anyway.
+    if (sugg.kind === 'reasoning') return
+    if (sugg.kind === 'existing') {
+      applyBackgroundUpdate(prev => prev.map(l =>
+        l.id === id ? { ...l, category: sugg.category, pending_suggestion: null } : l
+      ))
+      return
+    }
+    // kind === 'new': add the category to the sidebar with the AI-drafted
+    // description, then apply it to every item currently queued under this
+    // proposed name (all sharing the same chip).
+    const { linkIds, description } = acceptPendingNew(sugg.category)
+    const idSet = new Set(linkIds.length > 0 ? linkIds : [id])
+    if (!categories.includes(sugg.category)) {
+      const updatedCats = [...new Set([...categories, sugg.category])]
+      setCategories(updatedCats)
+      saveCategories(updatedCats)
+      saveCategoryDescription(sugg.category, description || sugg.description)
+    }
+    applyBackgroundUpdate(prev => prev.map(l =>
+      idSet.has(l.id) ? { ...l, category: sugg.category, pending_suggestion: null } : l
+    ))
+  }
+
+  // Reminder handlers. Setting a new reminder for an item that already has
+  // one replaces the old (both server-side, via the Rust registry, and
+  // client-side, via the item's remind_at field). Clearing cancels the Rust
+  // task and nulls the field.
+  const handleSetReminder = (id: string, remindAtIso: string) => {
+    const link = links.find(l => l.id === id)
+    if (!link) return
+    const title = link.title || link.note || link.url || 'Later reminder'
+    mutateLinks(prev => prev.map(l => l.id === id ? { ...l, remind_at: remindAtIso } : l))
+    scheduleReminderNative(id, title, remindAtIso)
+  }
+  const handleClearReminder = (id: string) => {
+    mutateLinks(prev => prev.map(l => l.id === id ? { ...l, remind_at: null } : l))
+    cancelReminderNative(id)
+  }
+
+  // On mount: reschedule every pending future reminder (covers app restarts).
+  // Also cancel any reminder attached to a done or deleted item.
+  useEffect(() => {
+    if (WINDOW_LABEL !== 'library') return
+    const now = Date.now()
+    for (const link of links) {
+      if (!link.remind_at) continue
+      const target = new Date(link.remind_at).getTime()
+      if (isNaN(target)) continue
+      const title = link.title || link.note || link.url || 'Later reminder'
+      scheduleReminderNative(link.id, title, link.remind_at)
+      // If it's already in the past, the Rust side fires immediately.
+      void now // linted-quiet
+    }
+    // Listen for reminder-fired events from Rust → scroll to and highlight
+    // the referenced item. We surface via a query-param-like hash so
+    // LibraryPage can react and scroll.
+    let unlisten: (() => void) | undefined
+    ;(async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event')
+        unlisten = await listen<string>('later://reminder-fired', event => {
+          const id = event.payload
+          console.log('[later] reminder fired for', id)
+          window.location.hash = `#item=${encodeURIComponent(id)}`
+        })
+      } catch { }
+    })()
+    return () => { if (unlisten) unlisten() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handleRejectSuggestion = (id: string) => {
+    const link = links.find(l => l.id === id)
+    if (!link?.pending_suggestion) return
+    const sugg = link.pending_suggestion
+    if (sugg.kind === 'reasoning') return
+    logRejection({
+      text: link.title || link.note || link.url || '',
+      rejected_category: sugg.category,
+      kind: sugg.kind,
+      timestamp: new Date().toISOString(),
+    })
+    if (sugg.kind === 'new') rejectPendingNewOnItem(id, sugg.category)
+    applyBackgroundUpdate(prev => prev.map(l =>
+      l.id === id ? { ...l, pending_suggestion: null } : l
+    ))
   }
 
   // forcedCategory: if the user added this item while viewing a specific category,
@@ -288,14 +553,21 @@ export default function App() {
   }
 
   const handleCategoryChange = (id: string, category: string) => {
-    mutateLinks(prev => prev.map(l => l.id === id ? { ...l, category } : l))
-    if (!allCategories.includes(category)) handleAddCategory(category)
+    // Manual category change from the item's tag menu. Also clears any pending
+    // suggestion — the user has settled the question by picking directly.
+    mutateLinks(prev => prev.map(l => l.id === id ? { ...l, category, pending_suggestion: null } : l))
+    // If the user picked a category via the "+ New category" inline input on
+    // the item's popover, add it to the sidebar. Only sidebar entries count as
+    // user-defined categories, so this is the one place client-side we
+    // intentionally create one — driven by explicit user choice.
+    if (!categories.includes(category)) handleAddCategory(category)
   }
 
-  const handleAddCategory = (name: string) => {
+  const handleAddCategory = (name: string, description?: string) => {
     const updated = [...new Set([...categories, name])]
     setCategories(updated)
     saveCategories(updated)
+    if (description !== undefined) saveCategoryDescription(name, description)
   }
 
   const handleDeleteCategory = (name: string) => {
@@ -303,15 +575,18 @@ export default function App() {
       links: prev.links.map(l => l.category === name ? { ...l, category: null } : l),
       categories: prev.categories.filter(c => c !== name),
     }))
+    deleteCategoryDescription(name)
     if (view === `cat:${name}`) setView('library')
   }
 
   const handleDeleteItem = (id: string) => {
+    cancelReminderNative(id)
     mutateLinks(prev => prev.filter(l => l.id !== id))
   }
 
   const handleDeleteItems = (ids: string[]) => {
     if (ids.length === 0) return
+    ids.forEach(id => cancelReminderNative(id))
     const set = new Set(ids)
     mutateLinks(prev => prev.filter(l => !set.has(l.id)))
   }
@@ -380,23 +655,30 @@ export default function App() {
   }
 
   return (
-    <LibraryPage
-      links={links}
-      categories={allCategories}
-      activeView={view}
-      search={search}
-      onNavigate={handleNavigate}
-      onAddCategory={handleAddCategory}
-      onDeleteCategory={handleDeleteCategory}
-      onDone={handleDone}
-      onSearchChange={setSearch}
-      onCategoryChange={handleCategoryChange}
-      onUpdateItem={handleUpdateItem}
-      onAddItem={handleSave}
-      onDeleteItem={handleDeleteItem}
-      onDeleteItems={handleDeleteItems}
-      onSplitItem={handleSplitItem}
-      onMergeItems={handleMergeItems}
-    />
+    <>
+      <LibraryPage
+        links={links}
+        categories={allCategories}
+        activeView={view}
+        search={search}
+        onNavigate={handleNavigate}
+        onAddCategory={handleAddCategory}
+        onDeleteCategory={handleDeleteCategory}
+        onDone={handleDone}
+        onSearchChange={setSearch}
+        onCategoryChange={handleCategoryChange}
+        onUpdateItem={handleUpdateItem}
+        onAddItem={handleSave}
+        onDeleteItem={handleDeleteItem}
+        onDeleteItems={handleDeleteItems}
+        onSplitItem={handleSplitItem}
+        onMergeItems={handleMergeItems}
+        onAcceptSuggestion={handleAcceptSuggestion}
+        onRejectSuggestion={handleRejectSuggestion}
+        onSetReminder={handleSetReminder}
+        onClearReminder={handleClearReminder}
+      />
+      {showOnboarding && <Onboarding onDone={() => setShowOnboarding(false)} />}
+    </>
   )
 }

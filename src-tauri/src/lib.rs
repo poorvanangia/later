@@ -1,9 +1,19 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, WebviewUrl, WebviewWindowBuilder,
+    Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+
+// Registry of in-flight reminder tasks. Each entry is a JoinHandle we can
+// abort when the user cancels or replaces a reminder. Keyed by link id.
+// Cleared on task completion so we never abort a fired reminder.
+static REMINDER_TASKS: Mutex<Option<HashMap<String, tokio::task::JoinHandle<()>>>> = Mutex::new(None);
+
+const REMINDER_FIRED_EVENT: &str = "later://reminder-fired";
 
 const POPUP_LABEL: &str = "popup";
 const SPOTLIGHT_LABEL: &str = "main";
@@ -52,20 +62,46 @@ async fn fetch_title(url: String) -> String {
 const LATER_API_BASE: &str = "https://later-api.poorvanangia03.workers.dev";
 const LATER_API_KEY: &str = "c98175fec0af0ae02de9795fc7361132957c4163ceb3b403480c28dc5dc1e5b3";
 
+// Returns the raw JSON object from the worker's /classify endpoint, forwarded
+// to the JS side for verdict handling. Shape:
+//   { decision: "assign"|"suggest_existing"|"suggest_new"|"none",
+//     category: string, description: string, reason: string }
+// On any failure (network, non-2xx, malformed JSON) returns
+//   { decision: "none", category: "", description: "", reason: "<code>" }
+// so the client always sees the same envelope and can decide UX without
+// null-checks.
 #[tauri::command]
-async fn classify_item(text: String, existing_categories: Option<Vec<String>>) -> String {
+async fn classify_item(
+    text: String,
+    existing_categories: Option<Vec<String>>,
+    category_descriptions: Option<serde_json::Value>,
+    pending_new_names: Option<Vec<String>>,
+    user_profile: Option<String>,
+) -> serde_json::Value {
     eprintln!("[later] classify_item called, text len: {}", text.len());
+
+    let fail = |reason: &str| -> serde_json::Value {
+        serde_json::json!({
+            "decision": "none",
+            "category": "",
+            "description": "",
+            "reason": reason,
+        })
+    };
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build() {
         Ok(c) => c,
-        Err(e) => { eprintln!("[later] classify_item client build failed: {}", e); return String::new(); }
+        Err(e) => { eprintln!("[later] classify_item client build failed: {}", e); return fail("client_build_failed"); }
     };
 
     let body = serde_json::json!({
         "text": text,
         "existing_categories": existing_categories.unwrap_or_default(),
+        "category_descriptions": category_descriptions.unwrap_or(serde_json::json!({})),
+        "pending_new_names": pending_new_names.unwrap_or_default(),
+        "user_profile": user_profile.unwrap_or_default(),
     });
 
     let url = format!("{}/classify", LATER_API_BASE);
@@ -77,23 +113,89 @@ async fn classify_item(text: String, existing_categories: Option<Vec<String>>) -
         .send()
         .await {
         Ok(r) => r,
-        Err(e) => { eprintln!("[later] classify_item request failed: {}", e); return String::new(); }
+        Err(e) => { eprintln!("[later] classify_item request failed: {}", e); return fail("request_failed"); }
     };
 
     let status = res.status();
     let json: serde_json::Value = match res.json().await {
         Ok(j) => j,
-        Err(e) => { eprintln!("[later] classify_item json parse failed (HTTP {}): {}", status, e); return String::new(); }
+        Err(e) => { eprintln!("[later] classify_item json parse failed (HTTP {}): {}", status, e); return fail("json_parse_failed"); }
     };
 
     if !status.is_success() {
         eprintln!("[later] classify_item HTTP {} response: {}", status, json);
-        return String::new();
+        return fail("http_error");
     }
 
-    let category = json["category"].as_str().unwrap_or("").trim().to_string();
-    eprintln!("[later] classify_item → {:?}", category);
-    category
+    eprintln!("[later] classify_item → {}", json);
+    json
+}
+
+// Second-pass classification for items Haiku wasn't confident about. Same
+// contract as classify_item but hits /reclassify (Sonnet 4.6 + extended
+// thinking). Client only calls this when the first-pass decision was
+// suggest_existing / suggest_new — never for confident assigns.
+#[tauri::command]
+async fn reclassify_item(
+    text: String,
+    existing_categories: Option<Vec<String>>,
+    category_descriptions: Option<serde_json::Value>,
+    pending_new_names: Option<Vec<String>>,
+    user_profile: Option<String>,
+) -> serde_json::Value {
+    eprintln!("[later] reclassify_item called, text len: {}", text.len());
+
+    let fail = |reason: &str| -> serde_json::Value {
+        serde_json::json!({
+            "decision": "none",
+            "category": "",
+            "description": "",
+            "reason": reason,
+        })
+    };
+
+    let client = match reqwest::Client::builder()
+        // Sonnet + extended thinking takes noticeably longer than Haiku; give
+        // it 30s. Client-side loading state absorbs the wait.
+        .timeout(std::time::Duration::from_secs(30))
+        .build() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("[later] reclassify_item client build failed: {}", e); return fail("client_build_failed"); }
+    };
+
+    let body = serde_json::json!({
+        "text": text,
+        "existing_categories": existing_categories.unwrap_or_default(),
+        "category_descriptions": category_descriptions.unwrap_or(serde_json::json!({})),
+        "pending_new_names": pending_new_names.unwrap_or_default(),
+        "user_profile": user_profile.unwrap_or_default(),
+    });
+
+    let url = format!("{}/reclassify", LATER_API_BASE);
+    let res = match client
+        .post(&url)
+        .header("X-Later-Auth", LATER_API_KEY)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await {
+        Ok(r) => r,
+        Err(e) => { eprintln!("[later] reclassify_item request failed: {}", e); return fail("request_failed"); }
+    };
+
+    let status = res.status();
+    let json: serde_json::Value = match res.json().await {
+        Ok(j) => j,
+        Err(e) => { eprintln!("[later] reclassify_item json parse failed (HTTP {}): {}", status, e); return fail("json_parse_failed"); }
+    };
+
+    if !status.is_success() {
+        eprintln!("[later] reclassify_item HTTP {} response: {}", status, json);
+        return fail("http_error");
+    }
+
+    eprintln!("[later] reclassify_item → {}", json);
+    json
 }
 
 #[tauri::command]
@@ -182,39 +284,291 @@ async fn hide_spotlight(app: tauri::AppHandle) {
 
 #[tauri::command]
 async fn open_library(app: tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window(LIBRARY_LABEL) {
-        let _ = window.show();
-        let _ = window.set_focus();
-        #[cfg(target_os = "macos")]
-        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
-    } else {
-        let window = WebviewWindowBuilder::new(
-            &app,
-            LIBRARY_LABEL,
-            WebviewUrl::App("index.html".into()),
-        )
-        .title("Later — Vault")
-        .inner_size(1100.0, 720.0)
-        .min_inner_size(700.0, 500.0)
-        .resizable(true)
-        .visible(true)
-        .decorations(true)
-        .build();
+    show_or_open_library(&app);
+}
 
-        if let Ok(win) = window {
-            let app_handle = app.clone();
-            win.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { .. } = event {
-                    #[cfg(target_os = "macos")]
-                    let _ = app_handle.set_activation_policy(tauri::ActivationPolicy::Accessory);
-                }
-            });
-            #[cfg(target_os = "macos")]
-            let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+// Schedule a one-time reminder for `link_id`. Any prior task for the same id
+// is aborted (v1 rule: setting a new reminder replaces the old one — never
+// stacks). If `remind_at_iso` is already in the past, the notification fires
+// immediately, matching the "missed reminder" fallback for reminders that
+// were scheduled before the app was quit.
+#[tauri::command]
+async fn schedule_reminder(
+    app: tauri::AppHandle,
+    link_id: String,
+    title: String,
+    remind_at_iso: String,
+) -> Result<(), String> {
+    // Parse the ISO datetime. Only a naive check — anything the worker's
+    // parser produces conforms, and any user-picker output will too.
+    let when = parse_iso_to_instant(&remind_at_iso)
+        .ok_or_else(|| "invalid_iso".to_string())?;
+
+    // Abort any existing task for this id.
+    cancel_reminder_task(&link_id);
+
+    let app_handle = app.clone();
+    let title_for_task = title.clone();
+    let id_for_task = link_id.clone();
+    let handle = tokio::spawn(async move {
+        let now = std::time::Instant::now();
+        if when > now {
+            tokio::time::sleep(when - now).await;
+        }
+        // Fire the notification.
+        // Show the custom reminder card in the top-right corner instead of a
+        // native macOS notification. The card doesn't steal focus and stays
+        // put until the user hits Okay or View.
+        show_reminder_window(&app_handle, &id_for_task, &title_for_task);
+        // Remove the completed task from the registry.
+        let mut guard = REMINDER_TASKS.lock().unwrap();
+        if let Some(map) = guard.as_mut() {
+            map.remove(&id_for_task);
+        }
+    });
+
+    let mut guard = REMINDER_TASKS.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.insert(link_id, handle);
+    Ok(())
+}
+
+// Cancel a pending reminder for `link_id`. Safe to call even if there was
+// no active task (no-op in that case).
+#[tauri::command]
+async fn cancel_reminder(link_id: String) {
+    cancel_reminder_task(&link_id);
+}
+
+fn cancel_reminder_task(link_id: &str) {
+    let mut guard = REMINDER_TASKS.lock().unwrap();
+    if let Some(map) = guard.as_mut() {
+        if let Some(handle) = map.remove(link_id) {
+            handle.abort();
         }
     }
 }
 
+const REMINDER_WIDTH: f64 = 320.0;
+const REMINDER_HEIGHT: f64 = 130.0;
+
+// Build the label used for a reminder card window. One card per link id.
+fn reminder_label(link_id: &str) -> String {
+    // Window labels must be alphanumeric + underscore/hyphen. Link ids are
+    // already in that shape ("link-1788923875363") so a straight concat works.
+    format!("reminder_{}", link_id.replace('-', "_"))
+}
+
+// Percent-encode arbitrary text so it can safely ride in a URL query. Only
+// alphanumerics and a few reserved chars pass through untouched.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+// Spawn the custom reminder card window in the top-right corner. Transparent,
+// no chrome, doesn't steal focus. If a card for this link is already open we
+// bring it forward instead of stacking a second one.
+fn show_reminder_window(app: &tauri::AppHandle, link_id: &str, body_text: &str) {
+    let label = reminder_label(link_id);
+    if let Some(existing) = app.get_webview_window(&label) {
+        let _ = existing.show();
+        let _ = existing.set_always_on_top(true);
+        return;
+    }
+
+    let url = format!(
+        "reminder.html?id={}&text={}",
+        url_encode(link_id),
+        url_encode(body_text)
+    );
+
+    let build = WebviewWindowBuilder::new(
+        app,
+        &label,
+        WebviewUrl::App(url.into()),
+    )
+    .title("Later — Reminder")
+    .inner_size(REMINDER_WIDTH, REMINDER_HEIGHT)
+    .resizable(false)
+    .decorations(false)
+    .transparent(true)
+    .skip_taskbar(true)
+    .always_on_top(true)
+    // Turn OFF the OS-drawn window shadow — otherwise macOS paints a
+    // rectangular drop shadow around the entire webview, showing up as a
+    // gray halo around our rounded card. We supply our own shadow via CSS.
+    .shadow(false)
+    // Don't steal focus from whatever the user was doing.
+    .focused(false)
+    .visible(false)
+    .build();
+
+    let window = match build {
+        Ok(w) => w,
+        Err(e) => { eprintln!("[later] show_reminder_window build failed: {}", e); return; }
+    };
+
+    // Position top-right after build so we can read the monitor size.
+    if let Ok(Some(monitor)) = window.primary_monitor() {
+        let scale = monitor.scale_factor();
+        let screen_w = monitor.size().width as f64 / scale;
+        // 20px right margin, 40px top margin (below the menu bar).
+        let x = screen_w - REMINDER_WIDTH - 20.0;
+        let y = 40.0;
+        let _ = window.set_position(tauri::Position::Logical(
+            tauri::LogicalPosition::new(x, y),
+        ));
+    }
+    let _ = window.show();
+}
+
+// Close a reminder card. Called by the "Okay" button; also invoked by
+// open_item_from_reminder before it switches focus to the vault.
+#[tauri::command]
+async fn close_reminder_window(app: tauri::AppHandle, link_id: String) {
+    let label = reminder_label(&link_id);
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.close();
+    }
+}
+
+// "View" button: open the main vault window, emit an event carrying the item
+// id so the frontend can scroll to and highlight the item, and dismiss the
+// reminder card.
+#[tauri::command]
+async fn open_item_from_reminder(app: tauri::AppHandle, link_id: String) {
+    show_or_open_library(&app);
+    if let Err(e) = app.emit(REMINDER_FIRED_EVENT, &link_id) {
+        eprintln!("[later] emit reminder-fired failed: {}", e);
+    }
+    let label = reminder_label(&link_id);
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.close();
+    }
+}
+
+// Convert an ISO 8601 timestamp string to a tokio Instant relative to now.
+// We're deliberately not pulling in `chrono` — this parses just enough to
+// compute the delta from the current UNIX time to the target UNIX time and
+// build an Instant from it.
+fn parse_iso_to_instant(iso: &str) -> Option<std::time::Instant> {
+    // Formats we accept:
+    //   2026-09-09T09:00:00Z
+    //   2026-09-09T09:00:00.000Z
+    //   2026-09-09T09:00:00-07:00
+    //   2026-09-09T09:00:00.123-07:00
+    // Extract date + time + optional millis + timezone offset.
+    let bytes = iso.as_bytes();
+    if bytes.len() < 19 { return None; }
+    let year: i64 = iso.get(0..4)?.parse().ok()?;
+    let month: u32 = iso.get(5..7)?.parse().ok()?;
+    let day: u32 = iso.get(8..10)?.parse().ok()?;
+    let hour: u32 = iso.get(11..13)?.parse().ok()?;
+    let minute: u32 = iso.get(14..16)?.parse().ok()?;
+    let second: u32 = iso.get(17..19)?.parse().ok()?;
+
+    // Timezone suffix. Look for Z or +hh:mm / -hh:mm at the end.
+    let mut offset_seconds: i64 = 0;
+    let rest = &iso[19..];
+    // Skip optional .fractional
+    let after_frac = if let Some(dot_pos) = rest.find('.') {
+        let after_dot = &rest[dot_pos + 1..];
+        let end = after_dot.chars().take_while(|c| c.is_ascii_digit()).count();
+        &rest[dot_pos + 1 + end..]
+    } else {
+        rest
+    };
+    if let Some(first) = after_frac.chars().next() {
+        if first == 'Z' {
+            offset_seconds = 0;
+        } else if first == '+' || first == '-' {
+            let sign: i64 = if first == '+' { 1 } else { -1 };
+            let rest_off = &after_frac[1..];
+            let oh: i64 = rest_off.get(0..2)?.parse().ok()?;
+            let om: i64 = rest_off.get(3..5).and_then(|s| s.parse().ok()).unwrap_or(0);
+            offset_seconds = sign * (oh * 3600 + om * 60);
+        }
+    }
+
+    // Convert to UNIX seconds using days-from-civil algorithm (Howard Hinnant).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let m = month as i64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u64;
+    let days_from_epoch = era * 146097 + doe as i64 - 719468;
+    let target_unix = days_from_epoch * 86400
+        + (hour as i64) * 3600
+        + (minute as i64) * 60
+        + second as i64
+        - offset_seconds;
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+
+    let now_instant = std::time::Instant::now();
+    if target_unix <= now_unix {
+        // Past — return "now" so the task fires immediately.
+        Some(now_instant)
+    } else {
+        let delta = target_unix - now_unix;
+        Some(now_instant + std::time::Duration::from_secs(delta as u64))
+    }
+}
+
+// Shared implementation used by both the `open_library` Tauri command (called
+// from JS) and the tray-icon click handler (Rust-only path). Extracted so
+// both entry points give identical behaviour: focus the existing window if
+// present, otherwise build a new one and switch the app to Regular activation
+// policy so the Dock icon appears.
+fn show_or_open_library(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(LIBRARY_LABEL) {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        #[cfg(target_os = "macos")]
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+        return;
+    }
+    let window = WebviewWindowBuilder::new(
+        app,
+        LIBRARY_LABEL,
+        WebviewUrl::App("index.html".into()),
+    )
+    .title("Later — Vault")
+    .inner_size(1100.0, 720.0)
+    .min_inner_size(700.0, 500.0)
+    .resizable(true)
+    .visible(true)
+    .decorations(true)
+    .build();
+
+    if let Ok(win) = window {
+        let app_handle = app.clone();
+        win.on_window_event(move |event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                #[cfg(target_os = "macos")]
+                let _ = app_handle.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
+        });
+        #[cfg(target_os = "macos")]
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    }
+}
+
+#[allow(dead_code)]  // Popup path is retired — tray now opens the main window directly.
 fn toggle_popup(app: &tauri::AppHandle, position: Option<(f64, f64)>) {
     if let Some(window) = app.get_webview_window(POPUP_LABEL) {
         if window.is_visible().unwrap_or(false) {
@@ -233,6 +587,7 @@ fn toggle_popup(app: &tauri::AppHandle, position: Option<(f64, f64)>) {
     }
 }
 
+#[allow(dead_code)]  // Popup path is retired — first-launch now opens the main window directly.
 fn show_popup_centered(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window(POPUP_LABEL) {
         if let Ok(Some(monitor)) = window.primary_monitor() {
@@ -312,7 +667,8 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, generate_title, open_library, hide_spotlight, submit_email, finalize_first_launch])
+        .plugin(tauri_plugin_notification::init())
+        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, reclassify_item, generate_title, open_library, hide_spotlight, submit_email, finalize_first_launch, schedule_reminder, cancel_reminder, close_reminder_window, open_item_from_reminder])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -371,10 +727,10 @@ pub fn run() {
                 });
             }
 
-            // Cmd+Shift+L → spotlight
+            // Cmd+K → spotlight (globally registered; fires from any app).
             let shortcut = Shortcut::new(
-                Some(Modifiers::SUPER | Modifiers::SHIFT),
-                Code::KeyL,
+                Some(Modifiers::SUPER),
+                Code::KeyK,
             );
             let app_handle = app.handle().clone();
             app.global_shortcut().on_shortcut(shortcut, move |_app, _shortcut, event| {
@@ -383,29 +739,75 @@ pub fn run() {
                 }
             })?;
 
-            // Tray click → popup. Use a dedicated tray icon (just the bookmark glyph
-            // on a transparent canvas) so macOS template rendering shows the glyph
-            // alone — the app icon includes the white rounded-square frame, which
-            // would draw as a solid square in the menu bar.
+            // Tray click → open the main library window. Previously this opened
+            // a small tray popup; now we skip the popup entirely and jump
+            // straight to the full vault view (matches user's expectation that
+            // clicking the icon = "open the app").
             let tray_icon = tauri::image::Image::from_bytes(
                 include_bytes!("../icons/tray-icon.png"),
             )
             .expect("embedded tray-icon.png must decode");
 
+            // Right-click / Control-click menu. Structure follows the standard
+            // menu-bar-app pattern (Granola, Rectangle, Cleanshot, etc.):
+            // primary action first, then app-open, separator, quit at the
+            // bottom with its standard Cmd+Q accelerator.
+            let add_item = MenuItem::with_id(
+                app,
+                "menu_add_item",
+                "Add item",
+                true,
+                Some("Cmd+K"),
+            )?;
+            let open_vault = MenuItem::with_id(
+                app,
+                "menu_open_vault",
+                "Open vault",
+                true,
+                None::<&str>,
+            )?;
+            let separator = PredefinedMenuItem::separator(app)?;
+            let quit = MenuItem::with_id(
+                app,
+                "menu_quit",
+                "Quit Later",
+                true,
+                Some("Cmd+Q"),
+            )?;
+            let tray_menu = Menu::with_items(app, &[
+                &add_item,
+                &open_vault,
+                &separator,
+                &quit,
+            ])?;
+
             let _tray = TrayIconBuilder::new()
                 .icon(tray_icon)
                 .icon_as_template(true)
-                .tooltip("Later — Click for recent · ⌘⇧L for quick save")
+                .tooltip("Later — Click to open vault · ⌘K for quick save · right-click for menu")
+                .menu(&tray_menu)
+                // macOS default with a menu attached is to also show the menu
+                // on left-click. Disabling that so left-click keeps its
+                // existing behavior (open vault) — right-click is the only
+                // path to the menu, matching the additive spirit of the ask.
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| {
+                    match event.id.as_ref() {
+                        "menu_add_item" => toggle_spotlight(app),
+                        "menu_open_vault" => show_or_open_library(app),
+                        "menu_quit" => app.exit(0),
+                        _ => {}
+                    }
+                })
                 .on_tray_icon_event(|tray, event| {
                     match event {
                         TrayIconEvent::Click {
                             button: MouseButton::Left,
                             button_state: MouseButtonState::Up,
-                            position,
                             ..
                         } => {
                             let app = tray.app_handle();
-                            toggle_popup(app, Some((position.x, position.y)));
+                            show_or_open_library(app);
                         }
                         _ => {}
                     }
@@ -424,12 +826,11 @@ pub fn run() {
                 .map(|p| p.exists())
                 .unwrap_or(true);
             if !marker_present {
-                eprintln!("[later] first-launch marker missing — will auto-open popup");
-                HIDE_POPUP_ON_BLUR.store(false, Ordering::Relaxed);
+                eprintln!("[later] first-launch marker missing — will auto-open library");
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(500));
-                    show_popup_centered(&handle);
+                    show_or_open_library(&handle);
                 });
             } else {
                 eprintln!("[later] first-launch marker present — normal launch");

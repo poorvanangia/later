@@ -1,5 +1,15 @@
 import { useState, useRef, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { incrementCmdKUsageCount } from '../lib/hints'
+
+const SYNC_EVENT = 'later://state-changed'
+
+async function broadcastChange() {
+  try {
+    const { emit } = await import('@tauri-apps/api/event')
+    await emit(SYNC_EVENT)
+  } catch { }
+}
 
 const PLACEHOLDERS = [
   'Paste a link, write a note, or save anything…',
@@ -24,10 +34,20 @@ export function SpotlightBar({ onSave }: Props) {
   const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
+    // Initial mount: count as one usage (SpotlightBar only mounts because the
+    // window was just shown — either via Cmd+K or the tray).
+    incrementCmdKUsageCount()
+    broadcastChange()
     inputRef.current?.focus()
     // React stays mounted across hide/show cycles, so refocus when the window
-    // regains focus — otherwise the next Cmd+Shift+L lands on a blurred input.
-    const onFocus = () => inputRef.current?.focus()
+    // regains focus — otherwise the next Cmd+K lands on a blurred input.
+    // Every focus event corresponds to the shortcut being triggered again, so
+    // it's also the right hook to bump the usage counter.
+    const onFocus = () => {
+      inputRef.current?.focus()
+      incrementCmdKUsageCount()
+      broadcastChange()
+    }
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)
   }, [])
@@ -123,12 +143,12 @@ export function SpotlightBar({ onSave }: Props) {
           ) : (
             <span style={{
               fontSize: 17,
-              fontWeight: 600,
-              fontFamily: "'Fraunces', serif",
+              fontWeight: 900,
+              fontFamily: "'Playfair Display', serif",
               color: '#1a1a1a',
               letterSpacing: '-0.2px',
             }}>
-              L<span style={{ color: '#a10808' }}>.</span>
+              L<span style={{ color: '#2d8a4e' }}>.</span>
             </span>
           )}
         </div>
