@@ -71,7 +71,10 @@ NAMING CONVENTIONS for "suggest_new":
 - Use the singular or standard form users would say in conversation. "Shopping" not "Purchases"; "Travel" not "Trips"; "Home" not "Household Management".
 - Even if the user's other categories use jargon (e.g. "Company Ops"), don't mirror that tone for personal-life items — those get plain names.
 
-DOMAIN ROUTING — the following item types belong in dedicated buckets, NOT stretched into a nearby existing category:
+DOMAIN ROUTING (HIGHEST PRIORITY — overrides the description-authoritative rule above):
+The item types listed below have SO strong an association with their named bucket that they route there even when another category's description would technically cover them. A broad Work - Ops description like "anything I need to do for the company" does NOT capture a flight booking — flights go to Travel. Same for shopping, health, home, etc. When in doubt for these domains, prefer suggest_new for the domain-named bucket over assigning to a topically-adjacent existing one.
+
+
 
   SHOPPING (physical goods you buy): electronics, appliances, phones, clothes, furniture, groceries.
     "Order a microwave" / "Buy a new phone" / "Order running shoes" → Shopping (or suggest_new Shopping)

@@ -31,3 +31,7 @@ dist-beta/
 src-tauri/target/
 .DS_Store
 *.log
+.env
+.agents/
+.claude/
+skills-lock.json
