@@ -87,7 +87,6 @@ jobs:
       # instead — matches what scripts/release.sh did before it was removed.
       - name: Build .dmg with create-dmg
         run: |
-          npm install --global create-dmg
           mkdir -p src-tauri/target/release/bundle/dmg
           npm run dmg:build
           VERSION="${GITHUB_REF_NAME#v}"
