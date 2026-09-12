@@ -65,16 +65,12 @@ jobs:
           echo "KEYCHAIN_PATH=$KEYCHAIN" >> "$GITHUB_ENV"
 
       # `tauri build` with TAURI_SIGNING_PRIVATE_KEY set produces (given
-      # bundle.targets: ["app", "dmg"] + bundle.macOS.dmg config in
-      # tauri.conf.json):
+      # bundle.targets: ["app"] + bundle.macOS.dmg config in tauri.conf.json):
       #   src-tauri/target/release/bundle/macos/Later.app           (signed)
       #   src-tauri/target/release/bundle/macos/Later.app.tar.gz + .sig  (updater)
-      #   src-tauri/target/release/bundle/dmg/Later_$VER_aarch64.dmg (signed)
-      # Tauri's DMG bundler now respects the background + icon-position config
-      # in tauri.conf.json, so we no longer need a separate create-dmg pass.
       # We do NOT set APPLE_ID/APPLE_PASSWORD here — else tauri would try to
       # notarize before the DMG exists. Notarization runs as its own step.
-      - name: Build .app + .dmg + updater
+      - name: Build .app + updater
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
@@ -85,6 +81,18 @@ jobs:
           # bundle. Deleting just target/release/bundle keeps the compile cache.
           rm -rf src-tauri/target/release/bundle
           npm run tauri:build
+
+      # Tauri's built-in DMG bundler doesn't apply our custom background/icon
+      # layout in CI's headless environment (works fine locally). Use create-dmg
+      # instead — matches what scripts/release.sh did before it was removed.
+      - name: Build .dmg with create-dmg
+        run: |
+          npm install --global create-dmg
+          mkdir -p src-tauri/target/release/bundle/dmg
+          npm run dmg:build
+          VERSION="${GITHUB_REF_NAME#v}"
+          BUILT_DMG="$(ls -t src-tauri/target/release/bundle/dmg/*.dmg | head -1)"
+          mv "$BUILT_DMG" "src-tauri/target/release/bundle/dmg/Later_${VERSION}_aarch64.dmg"
 
       - name: Locate artifacts
         run: |
