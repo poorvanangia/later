@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { LibraryPage } from './components/LibraryPage'
 import { SpotlightBar } from './components/SpotlightBar'
 import { Onboarding } from './components/Onboarding'
@@ -88,12 +88,9 @@ export type LinkRow = {
   source_ref?: LinkSourceRef | null
 }
 
-export type LinkSourceRef = {
-  kind: 'gmail'
-  thread_id: string
-  message_id: string
-  url: string     // pre-computed deep link, so the UI never needs Gmail's URL scheme
-}
+export type LinkSourceRef =
+  | { kind: 'gmail'; thread_id: string; message_id: string; url: string }
+  | { kind: 'linkedin'; post_urn: string; url: string }
 
 function loadLinks(): LinkRow[] {
   try {
@@ -543,6 +540,123 @@ export default function App() {
           window.location.hash = `#item=${encodeURIComponent(id)}`
         })
       } catch { }
+    })()
+    return () => { if (unlisten) unlisten() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Deep-link save handler. Fires when the Chrome extension shoots a
+  // `later://save?…` URL at us — with an email's subject / sender / thread IDs
+  // encoded as query params. The ref indirection is deliberate: the listener
+  // is registered once on mount, but the handler reads state (mutateLinks,
+  // classifyItem) that changes every render. Assigning `.current` fresh each
+  // render keeps the handler pointing at the latest closures.
+  const handleDeepLinkRef = useRef<(url: string) => void>(() => {})
+  handleDeepLinkRef.current = (rawUrl: string) => {
+    let parsed: URL
+    try { parsed = new URL(rawUrl) } catch (e) {
+      console.warn('[later] deep-link: bad URL', rawUrl, e)
+      return
+    }
+    if (parsed.protocol !== 'later:') return
+    // Currently only later://save is defined. Ignore other paths silently so
+    // future scheme routes don't accidentally match this handler.
+    if (parsed.host !== 'save') {
+      console.log('[later] deep-link: unhandled route', parsed.host)
+      return
+    }
+    const params = parsed.searchParams
+    const kind = params.get('kind') || 'gmail'
+
+    if (kind === 'linkedin') {
+      const title = params.get('title')?.trim() || 'LinkedIn post'
+      const author = params.get('author')?.trim() || ''
+      // LinkedIn's current DOM hides post permalinks, so v1 saves fall back to
+      // the feed root — badge remains clickable but goes to LinkedIn home, not
+      // the specific post. Revisit when we have URN extraction working.
+      const url = params.get('url')?.trim() || 'https://www.linkedin.com/feed/'
+      const postUrn = params.get('postUrn')?.trim() || ''
+      const id = `link-${Date.now()}`
+      const newLink: LinkRow = {
+        id, url, title, note: author || null,
+        category: null, label: null, read_time_minutes: null, intent: null,
+        is_done: false, ai_processed: true, created_at: new Date().toISOString(),
+        item_type: 'link',
+        source_ref: { kind: 'linkedin', post_urn: postUrn, url },
+        remind_at: null, fired_at: null, acknowledged_at: null,
+      }
+      mutateLinks(prev => [newLink, ...prev])
+      const classifierText = author ? `${title} — from ${author}` : title
+      setTimeout(() => classifyItem(id, classifierText), 100)
+      return
+    }
+
+    const title = params.get('title')?.trim() || 'Untitled email'
+    const senderName = params.get('sender')?.trim() || ''
+    const senderEmail = params.get('senderEmail')?.trim() || ''
+    const threadId = params.get('threadId')?.trim() || ''
+    const messageId = params.get('messageId')?.trim() || ''
+    const gmailUrl = params.get('gmailUrl')?.trim() || ''
+    if (!threadId || !gmailUrl) {
+      console.warn('[later] deep-link save: missing threadId/gmailUrl', rawUrl)
+      return
+    }
+    const noteText = senderName && senderEmail
+      ? `${senderName} <${senderEmail}>`
+      : (senderName || senderEmail || null)
+    const id = `link-${Date.now()}`
+    const newLink: LinkRow = {
+      id,
+      url: gmailUrl,
+      title,
+      note: noteText,
+      category: null,
+      label: null,
+      read_time_minutes: null,
+      intent: null,
+      is_done: false,
+      // Mark ai_processed=true here — Gmail items skip the fetchTitle/OG pass
+      // (there's no page metadata to scrape), so we don't want the shimmer
+      // "still loading" affordance the row shows while ai_processed is false.
+      ai_processed: true,
+      created_at: new Date().toISOString(),
+      item_type: 'link',
+      source_ref: {
+        kind: 'gmail',
+        thread_id: threadId,
+        message_id: messageId,
+        url: gmailUrl,
+      },
+      remind_at: null,
+      fired_at: null,
+      acknowledged_at: null,
+    }
+    mutateLinks(prev => [newLink, ...prev])
+    // Classifier gets subject + sender since sender often carries category
+    // signal ("Airbnb" → travel; a colleague's name → work). Matches the "same
+    // AI logic as any other item" contract in the extension spec.
+    const classifierText = senderName ? `${title} — from ${senderName}` : title
+    setTimeout(() => classifyItem(id, classifierText), 100)
+  }
+
+  useEffect(() => {
+    if (WINDOW_LABEL !== 'library') return
+    let unlisten: (() => void) | undefined
+    ;(async () => {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core')
+        const { listen } = await import('@tauri-apps/api/event')
+        // Drain any URLs the OS delivered before React was ready (cold start
+        // via later://…). frontend_ready also flips a Rust flag so subsequent
+        // deliveries emit straight to us via the event below.
+        const pending = await invoke<string[]>('frontend_ready')
+        for (const url of pending) handleDeepLinkRef.current(url)
+        unlisten = await listen<string>('later://deep-link', event => {
+          handleDeepLinkRef.current(event.payload)
+        })
+      } catch (e) {
+        console.warn('[later] deep-link setup failed (probably not in Tauri)', e)
+      }
     })()
     return () => { if (unlisten) unlisten() }
     // eslint-disable-next-line react-hooks/exhaustive-deps

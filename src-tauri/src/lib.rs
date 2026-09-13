@@ -6,6 +6,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
 };
+use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 mod gmail_config;
@@ -41,6 +42,18 @@ static REMINDER_QUEUE: Mutex<Option<ReminderQueue>> = Mutex::new(None);
 // straight to localStorage (shared across webviews on the same protocol),
 // so we no longer need a separate ack event on the wire.
 const REMINDER_VIEW_EVENT: &str = "later://reminder-view-requested";
+
+// Fired for every incoming later:// URL — carries the full URL as a string
+// payload. The React side parses it (see App.tsx) and dispatches based on the
+// path (currently just `save` for Gmail extension handoff). Cold-start URLs
+// (app launched via later://…) are buffered until the frontend calls
+// `frontend_ready`, then flushed in one shot.
+const DEEP_LINK_EVENT: &str = "later://deep-link";
+
+// URLs received before the frontend subscribed. Drained by `frontend_ready`.
+// Kept as raw strings — the React handler owns parsing.
+static PENDING_DEEP_LINKS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static FRONTEND_READY: AtomicBool = AtomicBool::new(false);
 
 const POPUP_LABEL: &str = "popup";
 const SPOTLIGHT_LABEL: &str = "main";
@@ -877,6 +890,24 @@ fn first_launch_marker_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf
 // Called from React once the user submits or skips the onboarding overlay.
 // Writes the marker (so subsequent launches skip auto-open) and re-enables
 // the blur-hide handler (so the popup dismisses normally from now on).
+// Called by React on library-window mount. Flips the ready flag so future
+// deep-link URLs emit straight to the frontend, and returns any URLs that
+// arrived before we were listening (cold-start via later://…). Safe to call
+// more than once — the drain just returns empty on repeats.
+#[tauri::command]
+async fn frontend_ready(app: tauri::AppHandle) -> Vec<String> {
+    FRONTEND_READY.store(true, Ordering::Relaxed);
+    let drained: Vec<String> = {
+        let mut pending = PENDING_DEEP_LINKS.lock().unwrap();
+        pending.drain(..).collect()
+    };
+    if !drained.is_empty() {
+        eprintln!("[later] frontend_ready: draining {} buffered deep link(s)", drained.len());
+        show_or_open_library(&app);
+    }
+    drained
+}
+
 #[tauri::command]
 async fn finalize_first_launch(app: tauri::AppHandle) {
     if let Some(marker) = first_launch_marker_path(&app) {
@@ -921,7 +952,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
-        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, reclassify_item, generate_title, open_library, hide_spotlight, submit_email, finalize_first_launch, schedule_reminder, cancel_reminder, close_reminder_window, open_item_from_reminder, connect_gmail, disconnect_gmail, gmail_connection_status, gmail_sync, extract_openloops])
+        .plugin(tauri_plugin_deep_link::init())
+        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, reclassify_item, generate_title, open_library, hide_spotlight, submit_email, finalize_first_launch, frontend_ready, schedule_reminder, cancel_reminder, close_reminder_window, open_item_from_reminder, connect_gmail, disconnect_gmail, gmail_connection_status, gmail_sync, extract_openloops])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -1066,6 +1098,31 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // Deep-link handler. Fires for later://… URLs — both cold-start
+            // (app launched fresh by the URL) and runtime (app already open,
+            // e.g. Chrome extension shipping saves while the vault is idle).
+            // If the frontend hasn't called `frontend_ready` yet we buffer the
+            // URL and let the drain path handle it on mount; otherwise we emit
+            // straight to the library window and bring it forward so the user
+            // sees the confirmation land in the vault.
+            let app_for_dl = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                let urls: Vec<String> = event.urls().iter().map(|u| u.to_string()).collect();
+                if urls.is_empty() { return; }
+                eprintln!("[later] deep-link received: {:?}", urls);
+                if FRONTEND_READY.load(Ordering::Relaxed) {
+                    for url in &urls {
+                        if let Err(e) = app_for_dl.emit(DEEP_LINK_EVENT, url) {
+                            eprintln!("[later] emit deep-link event failed: {}", e);
+                        }
+                    }
+                    show_or_open_library(&app_for_dl);
+                } else {
+                    let mut pending = PENDING_DEEP_LINKS.lock().unwrap();
+                    pending.extend(urls);
+                }
+            });
 
             // First-launch auto-open. If the marker is missing we (a) suppress
             // blur-hide so the popup can't be clobbered by startup focus

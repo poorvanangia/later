@@ -13,6 +13,29 @@ const TagIcon = () => (
   </svg>
 )
 
+// Gmail-source badge — envelope silhouette with the recognizable Gmail red
+// "M" stroke. Rendered instead of the domain favicon when the item came from
+// the Chrome extension. Sized to sit in the same 28x28 favicon slot without
+// visual weight change.
+const GmailIcon = () => (
+  <svg width="20" height="16" viewBox="0 0 20 16" fill="none" aria-label="From Gmail">
+    <rect x="0.75" y="0.75" width="18.5" height="14.5" rx="2.5" fill="#fff" stroke="#dcdcd6" strokeWidth="1"/>
+    <path d="M2 3.5L10 9L18 3.5" stroke="#ea4335" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/>
+  </svg>
+)
+
+// Pull just the sender name out of a stored note. The deep-link handler writes
+// notes in one of three shapes: "Name <email>", "Name", or bare "email". We
+// want the human-readable name for display; falling back to the email local-
+// part is better than nothing when there was no display name.
+function extractSenderName(note: string | null | undefined): string | null {
+  if (!note) return null
+  const angle = note.match(/^(.+?)\s*<[^>]+>$/)
+  if (angle) return angle[1].trim() || null
+  if (note.includes('@')) return note.split('@')[0].trim() || null
+  return note.trim() || null
+}
+
 type Props = {
   link: LinkRowType
   categories: string[]
@@ -22,13 +45,25 @@ type Props = {
 
 export function LinkRow({ link, categories, onDone, onCategoryChange }: Props) {
   const domain = getDomain(link.url)
-  const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=32` : null
-  const displayTitle = link.title || link.label || domain || link.url
+  const isGmail = link.source_ref?.kind === 'gmail'
+  // Gmail items get the envelope badge; the "domain" for these is always
+  // mail.google.com, which is redundant with the badge and would just clutter
+  // the row — so skip the favicon path entirely.
+  const faviconUrl = !isGmail && domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=32` : null
+  const rawTitle = link.title || link.label || domain || link.url
+  const senderName = isGmail ? extractSenderName(link.note) : null
+  // Per spec, Gmail rows read as "[icon] [Sender] — [Subject]" on the primary
+  // line. If we somehow have no sender (fallback empty note), just show subject.
+  const displayTitle = isGmail && senderName ? `${senderName} — ${rawTitle}` : rawTitle
 
-  const meta = [
-    domain,
-    link.ai_processed && link.read_time_minutes ? `${link.read_time_minutes} min read` : null,
-  ].filter(Boolean).join(' · ')
+  const meta = isGmail
+    // For Gmail items the badge already signals the source, and "mail.google.com"
+    // + read-time don't apply — collapsing the meta line keeps the row single-line.
+    ? ''
+    : [
+        domain,
+        link.ai_processed && link.read_time_minutes ? `${link.read_time_minutes} min read` : null,
+      ].filter(Boolean).join(' · ')
 
   const [hovered, setHovered] = useState(false)
   const [catOpen, setCatOpen] = useState(false)
@@ -84,16 +119,18 @@ export function LinkRow({ link, categories, onDone, onCategoryChange }: Props) {
           paddingRight: 62,
         }}
       >
-        {/* Favicon */}
+        {/* Favicon (or Gmail source badge, if the item came from the extension) */}
         <div style={{
           width: 28, height: 28, borderRadius: 6,
           background: '#f0f0ec', flexShrink: 0,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           overflow: 'hidden',
         }}>
-          {faviconUrl
-            ? <img src={faviconUrl} width={16} height={16} alt="" style={{ objectFit: 'contain' }} onError={(e) => { e.currentTarget.style.display = 'none' }} />
-            : <span style={{ fontSize: 11, color: '#bbb' }}>↗</span>
+          {isGmail
+            ? <GmailIcon />
+            : faviconUrl
+              ? <img src={faviconUrl} width={16} height={16} alt="" style={{ objectFit: 'contain' }} onError={(e) => { e.currentTarget.style.display = 'none' }} />
+              : <span style={{ fontSize: 11, color: '#bbb' }}>↗</span>
           }
         </div>
 
