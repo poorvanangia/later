@@ -8,8 +8,6 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
-mod gmail_config;
-mod gmail_oauth;
 
 // Registry of in-flight reminder tasks. Each entry is a JoinHandle we can
 // abort when the user cancels or replaces a reminder. Keyed by link id.
@@ -557,89 +555,6 @@ async fn open_item_from_reminder(app: tauri::AppHandle, link_id: String) {
     advance_queue(&app);
 }
 
-// ---------- Gmail commands ----------
-//
-// connect_gmail runs the whole loopback OAuth dance (see gmail_oauth.rs)
-// and stores the refresh_token in the macOS Keychain. Returns the connected
-// account's email address on success. The frontend never sees the token.
-//
-// disconnect_gmail wipes the keychain entry. Doesn't revoke on Google's side
-// — that's the user's job in their Google Account settings, and doing it
-// programmatically requires an extra scope we don't want.
-//
-// gmail_connection_status is a cheap check the Settings page hits on mount
-// so it can show "Connected" without waiting for a full round-trip.
-#[tauri::command]
-async fn connect_gmail() -> Result<gmail_oauth::ConnectOk, gmail_oauth::ConnectError> {
-    gmail_oauth::run_connect_flow().await
-}
-
-#[tauri::command]
-async fn disconnect_gmail() -> Result<(), gmail_oauth::ConnectError> {
-    gmail_oauth::disconnect()
-}
-
-#[tauri::command]
-async fn gmail_connection_status() -> serde_json::Value {
-    serde_json::json!({
-        "connected": gmail_oauth::is_connected(),
-        "configured": gmail_config::is_configured(),
-    })
-}
-
-// Fetch new mail from Gmail via the worker. JS passes the last known
-// history_id (or null for initial fetch) and the worker returns metadata for
-// each new message plus the new history cursor. Rust reads the refresh_token
-// from Keychain so it never crosses the IPC boundary.
-#[tauri::command]
-async fn gmail_sync(since_history_id: Option<String>) -> serde_json::Value {
-    let refresh_token = match keyring::Entry::new(gmail_config::KEYCHAIN_SERVICE, gmail_config::KEYCHAIN_ACCOUNT_REFRESH)
-        .and_then(|e| e.get_password())
-    {
-        Ok(t) => t,
-        Err(_) => return serde_json::json!({ "error": "not_connected" }),
-    };
-
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(45))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return serde_json::json!({ "error": "http_client_build_failed", "detail": e.to_string() }),
-    };
-
-    let mut body = serde_json::json!({ "refresh_token": refresh_token });
-    if let Some(hid) = since_history_id {
-        body["since_history_id"] = serde_json::Value::String(hid);
-    }
-
-    match client
-        .post(format!("{}/gmail/sync", LATER_API_BASE))
-        .header("X-Later-Auth", LATER_API_KEY)
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(res) => {
-            let status = res.status();
-            match res.json::<serde_json::Value>().await {
-                Ok(j) => {
-                    if !status.is_success() {
-                        return serde_json::json!({ "error": "worker_error", "status": status.as_u16(), "detail": j });
-                    }
-                    j
-                }
-                Err(e) => serde_json::json!({ "error": "parse_failed", "detail": e.to_string() }),
-            }
-        }
-        Err(e) => serde_json::json!({ "error": "request_failed", "detail": e.to_string() }),
-    }
-}
-
-// Run LLM extraction on a batch of synced messages. JS passes the messages
-// verbatim from gmail_sync's output plus optional user_profile context.
-// Worker handles the Anthropic call and returns per-index verdicts.
 #[tauri::command]
 async fn extract_openloops(
     messages: serde_json::Value,
@@ -921,7 +836,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
-        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, reclassify_item, generate_title, open_library, hide_spotlight, submit_email, finalize_first_launch, schedule_reminder, cancel_reminder, close_reminder_window, open_item_from_reminder, connect_gmail, disconnect_gmail, gmail_connection_status, gmail_sync, extract_openloops])
+        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, reclassify_item, generate_title, open_library, hide_spotlight, submit_email, finalize_first_launch, schedule_reminder, cancel_reminder, close_reminder_window, open_item_from_reminder, extract_openloops])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);

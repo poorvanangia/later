@@ -59,7 +59,7 @@ function EmptyState() {
         Nothing waiting on you.
       </div>
       <div style={{ fontSize: 13, color: MUTED, lineHeight: 1.5 }}>
-        When something needs your attention from your inbox, it'll land here.
+        All caught up.
       </div>
     </div>
   )

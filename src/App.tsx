@@ -17,7 +17,6 @@ import {
 } from './lib/classifier'
 import { loadUserProfileText } from './lib/profile'
 import { scheduleReminderNative, cancelReminderNative } from './lib/reminders'
-import { startPollLoop } from './lib/gmailSync'
 import { loadOpenLoops, markAccepted, markRejected, loadGmailHistoryId, type OpenLoop } from './lib/openloops'
 
 const SYNC_EVENT = 'later://state-changed'
@@ -546,16 +545,6 @@ export default function App() {
     })()
     return () => { if (unlisten) unlisten() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  // Gmail poll loop — only in the library window (single owner) and only for
-  // the lifetime of that window. If the user closes and reopens the library,
-  // the loop restarts fresh; the sync cursor in localStorage means we don't
-  // re-process anything either way.
-  useEffect(() => {
-    if (WINDOW_LABEL !== 'library') return
-    const stop = startPollLoop()
-    return () => { stop() }
   }, [])
 
   // Accept an OpenLoop → real LinkRow. Runs through the same classifier path
