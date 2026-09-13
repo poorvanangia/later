@@ -6,8 +6,6 @@ import { isCmdKHintVisible } from '../lib/hints'
 import { ReminderPopover } from './ReminderPopover'
 import { formatReminderLabel, formatAcknowledgedAgo, getReminderState } from '../lib/reminders'
 import { SettingsPage } from './SettingsPage'
-import { OpenLoopsPage } from './OpenLoopsPage'
-import type { OpenLoop } from '../lib/openloops'
 
 // Bell icon — matches LinkRow's TagIcon convention: 11×11 render, 12×12
 // viewBox, 1.4 stroke, rounded caps, color inherited via currentColor.
@@ -53,12 +51,6 @@ type Props = {
   onRejectSuggestion?: (id: string) => void
   onSetReminder?: (id: string, remindAtIso: string) => void
   onClearReminder?: (id: string) => void
-  openLoopsCount: number
-  openLoops: OpenLoop[]
-  onAcceptOpenLoop: (loop: OpenLoop) => void
-  onRejectOpenLoop: (loop: OpenLoop) => void
-  showOpenLoopsNudge: boolean
-  onDismissOpenLoopsNudge: () => void
 }
 
 export function LibraryPage({
@@ -68,8 +60,6 @@ export function LibraryPage({
   onDeleteItems, onSplitItem, onMergeItems,
   onAcceptSuggestion, onRejectSuggestion,
   onSetReminder, onClearReminder,
-  openLoopsCount, openLoops, onAcceptOpenLoop, onRejectOpenLoop,
-  showOpenLoopsNudge, onDismissOpenLoopsNudge,
 }: Props) {
   const [reminderOpenId, setReminderOpenId] = useState<string | null>(null)
   const [addingCat, setAddingCat] = useState(false)
@@ -612,24 +602,7 @@ export function LibraryPage({
       <div style={{ padding: '4px 12px', marginBottom: 20 }}>
         <span style={{ fontSize: 22, fontWeight: 900, color: '#1a1a1a', fontFamily: "'Playfair Display', serif", letterSpacing: '-0.3px' }}>Later<span style={{ color: '#2d8a4e' }}>.</span></span>
       </div>
-      {/* Open-loops queue lives ABOVE Home in the nav — it's the highest-
-          priority actionable item, unlike Home which is the full list. Label
-          IS the count. When zero, we keep the entry (per spec) but render it
-          muted so it reads as "you're caught up" rather than absent. */}
-      <button
-        onClick={() => { onNavigate('openloops'); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }}
-        style={{
-          display: 'block', width: '100%', textAlign: 'left',
-          padding: '9px 12px', fontSize: 15, marginBottom: 4,
-          fontWeight: activeView === 'openloops' ? 600 : 500,
-          color: openLoopsCount === 0 ? '#a8a8a4' : '#1a1a1a',
-          background: activeView === 'openloops' ? '#eeede9' : 'none',
-          border: 'none', borderRadius: 6, cursor: 'pointer',
-          fontFamily: "'Fraunces', serif",
-        }}
-      >
-        {openLoopsCount} open {openLoopsCount === 1 ? 'loop' : 'loops'}
-      </button>
+
       <button onClick={() => { onNavigate('library'); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '9px 12px', fontSize: 17, marginBottom: 16, fontWeight: activeView === 'library' ? 600 : 500, color: '#1a1a1a', background: activeView === 'library' ? '#eeede9' : 'none', border: 'none', borderRadius: 6, cursor: 'pointer', fontFamily: "'Fraunces', serif" }}>Home</button>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 12px', marginBottom: 12 }}>
         <span style={{ fontSize: 15, fontWeight: 600, color: '#9a9a94', fontFamily: "'Fraunces', serif" }}>Categories</span>
@@ -747,37 +720,6 @@ export function LibraryPage({
   const listPanel = (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
       <div style={{ flex: 1, overflowY: 'auto', padding: '48px 56px 24px' }}>
-        {/* First-run nudge — only on the Home view (the default library list),
-            only when there's a pending open-loops count the user hasn't yet
-            dismissed. App.tsx resets the dismissed flag when the count goes
-            back to zero, so a fresh 0→N transition re-shows this. */}
-        {activeView === 'library' && showOpenLoopsNudge && (
-          <div style={{
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            padding: '10px 14px', marginBottom: 20,
-            background: '#eef5f0', border: '1px solid #cfe0d5', borderRadius: 8,
-          }}>
-            <button
-              onClick={() => onNavigate('openloops')}
-              style={{
-                fontSize: 13, color: '#1e6b3a', background: 'none',
-                border: 'none', cursor: 'pointer', fontFamily: 'inherit',
-                padding: 0, fontWeight: 500,
-              }}
-            >
-              {openLoopsCount} new {openLoopsCount === 1 ? 'thing' : 'things'} to review →
-            </button>
-            <button
-              onClick={onDismissOpenLoopsNudge}
-              title="Dismiss"
-              style={{
-                fontSize: 15, color: '#8ba894', background: 'none',
-                border: 'none', cursor: 'pointer', fontFamily: 'inherit',
-                padding: '0 4px', lineHeight: 1,
-              }}
-            >×</button>
-          </div>
-        )}
         <h1 style={{ fontSize: 28, fontWeight: 600, color: '#1a1a1a', letterSpacing: '-0.5px', marginBottom: 24, lineHeight: 1.2 }}>{getPageTitle()}</h1>
         <div style={{ maxWidth: 640 }}>
           {sorted.map((link, index) => {
@@ -1023,10 +965,8 @@ export function LibraryPage({
       {sidebar}
       {activeView === 'settings' ? (
         <SettingsPage />
-      ) : activeView === 'openloops' ? (
-        <OpenLoopsPage loops={openLoops} onAccept={onAcceptOpenLoop} onReject={onRejectOpenLoop} />
       ) : listPanel}
-      {activeView !== 'settings' && activeView !== 'openloops' && detailPanel}
+      {activeView !== 'settings' && detailPanel}
       {showCmdKHint && <CmdKHint />}
     </div>
   )

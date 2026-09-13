@@ -56,7 +56,7 @@ The app has three main layers:
 
 **Storage:** Saved items and categories live in localStorage. Tauri events keep the app's windows synchronized when data changes.
 
-**Gmail:** Authentication and inbox syncing have been removed. Previously imported items and the open-loop review UI remain available.
+**Gmail:** Authentication and inbox syncing have been removed. The Open Loops feature has also been removed. Items previously accepted into the library remain available.
 
 ## How AI classification works
 

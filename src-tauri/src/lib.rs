@@ -555,79 +555,6 @@ async fn open_item_from_reminder(app: tauri::AppHandle, link_id: String) {
     advance_queue(&app);
 }
 
-#[tauri::command]
-async fn extract_openloops(
-    messages: serde_json::Value,
-    user_profile: Option<String>,
-    user_email: Option<String>,
-) -> serde_json::Value {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return serde_json::json!({ "error": "http_client_build_failed", "detail": e.to_string() }),
-    };
-
-    let now_iso = chrono_like_now_iso();
-
-    let body = serde_json::json!({
-        "messages": messages,
-        "user_profile": user_profile.unwrap_or_default(),
-        "user_email": user_email.unwrap_or_default(),
-        "now_iso": now_iso,
-    });
-
-    match client
-        .post(format!("{}/extract_openloop", LATER_API_BASE))
-        .header("X-Later-Auth", LATER_API_KEY)
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(res) => {
-            let status = res.status();
-            match res.json::<serde_json::Value>().await {
-                Ok(j) => {
-                    if !status.is_success() {
-                        return serde_json::json!({ "error": "worker_error", "status": status.as_u16(), "detail": j });
-                    }
-                    j
-                }
-                Err(e) => serde_json::json!({ "error": "parse_failed", "detail": e.to_string() }),
-            }
-        }
-        Err(e) => serde_json::json!({ "error": "request_failed", "detail": e.to_string() }),
-    }
-}
-
-// Minimal ISO 8601 UTC formatter — same "don't pull chrono" stance as the
-// reminder parser. Only used to stamp the extraction prompt's "current time"
-// hint, so precision to the second is plenty.
-fn chrono_like_now_iso() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    // days-from-civil-inverse (Hinnant), then h/m/s from remainder.
-    let z = secs.div_euclid(86400) + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    let rem = secs.rem_euclid(86400);
-    let hh = (rem / 3600) as u32;
-    let mm = ((rem % 3600) / 60) as u32;
-    let ss = (rem % 60) as u32;
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hh, mm, ss)
-}
-
 // Parse ISO 8601 into UNIX seconds. Used to compare/sort remind_at values
 // across timezones — the queue picks the smallest (earliest = most overdue).
 fn parse_iso_to_unix(iso: &str) -> Option<i64> {
@@ -836,7 +763,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
-        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, reclassify_item, generate_title, open_library, hide_spotlight, submit_email, finalize_first_launch, schedule_reminder, cancel_reminder, close_reminder_window, open_item_from_reminder, extract_openloops])
+        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, reclassify_item, generate_title, open_library, hide_spotlight, submit_email, finalize_first_launch, schedule_reminder, cancel_reminder, close_reminder_window, open_item_from_reminder])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
