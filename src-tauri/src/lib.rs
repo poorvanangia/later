@@ -264,6 +264,23 @@ async fn generate_title(text: String) -> String {
 }
 
 #[tauri::command]
+async fn generate_starter_categories(profile: String) -> Vec<serde_json::Value> {
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build() { Ok(c) => c, Err(_) => return vec![] };
+    let body = serde_json::json!({ "profile": profile.trim() });
+    let url = format!("{}/starter_categories", LATER_API_BASE);
+    let res = match client.post(&url).header("X-Later-Auth", LATER_API_KEY).header("content-type", "application/json").json(&body).send().await { Ok(r) => r, Err(_) => return vec![] };
+    if !res.status().is_success() { return vec![] }
+    match res.json::<serde_json::Value>().await { Ok(v) => v["categories"].as_array().cloned().unwrap_or_default(), Err(_) => vec![] }
+}
+
+#[tauri::command]
+fn log_dev_cache_hit(kind: String, detail: String) {
+    if cfg!(debug_assertions) {
+        eprintln!("[later] using cached {} result{}", kind, detail);
+    }
+}
+
+#[tauri::command]
 async fn submit_email(email: String) -> Result<(), String> {
     let email = email.trim().to_string();
     eprintln!("[later] submit_email called, len: {}", email.len());
@@ -763,7 +780,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
-        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, reclassify_item, generate_title, open_library, hide_spotlight, submit_email, finalize_first_launch, schedule_reminder, cancel_reminder, close_reminder_window, open_item_from_reminder])
+        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, reclassify_item, generate_title, generate_starter_categories, log_dev_cache_hit, open_library, hide_spotlight, submit_email, finalize_first_launch, schedule_reminder, cancel_reminder, close_reminder_window, open_item_from_reminder])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);

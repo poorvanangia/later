@@ -1,14 +1,21 @@
 import { useState } from 'react'
 import { loadUserProfile, saveUserProfile, loadUserEmail, saveUserEmail } from '../lib/profile'
+import { CategoryReview } from './CategoryReview'
+import { generateStarterCategories, loadStarterCategoryState, saveStarterCategoryState, categorizeExistingItems, applyStarterCategories, type StarterCategory } from '../lib/starterCategories'
+
+const smallButton = { border: '1px solid #d8d4cc', borderRadius: 6, background: '#fff', color: '#555', padding: '5px 9px', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit' }
 
 export function SettingsPage() {
   const [savedText, setSavedText] = useState(() => loadUserProfile().text)
   const [text, setText] = useState(savedText)
   const [status, setStatus] = useState<'idle' | 'saved' | 'error'>('idle')
+  const [starterCategories, setStarterCategories] = useState<StarterCategory[] | null>(null)
+  const [offerRefresh, setOfferRefresh] = useState(false)
   const hasChanges = text.trim() !== savedText
 
-  const save = () => {
+  const save = async () => {
     if (!hasChanges) return
+    const wasEmpty = savedText.trim().length === 0
     const saved = saveUserProfile(text)
     const persisted = loadUserProfile()
     if (persisted.text !== saved.text || persisted.updatedAt !== saved.updatedAt) {
@@ -18,6 +25,25 @@ export function SettingsPage() {
     setSavedText(saved.text)
     setText(saved.text)
     setStatus('saved')
+    let categories: string[] = []
+    try { categories = JSON.parse(localStorage.getItem('later:categories') ?? '[]') } catch { }
+    if (saved.text && categories.length) void categorizeExistingItems()
+    if (wasEmpty && saved.text && categories.length === 0 && loadStarterCategoryState() === 'not_started') {
+      try {
+        const generated = await generateStarterCategories(saved.text)
+        if (generated.length) setStarterCategories(generated)
+      } catch { }
+    } else if (!wasEmpty && saved.text) {
+      setOfferRefresh(true)
+    }
+  }
+
+  const regenerateCategories = async () => {
+    setOfferRefresh(false)
+    try {
+      const generated = await generateStarterCategories(loadUserProfile().text)
+      if (generated.length) setStarterCategories(generated)
+    } catch { }
   }
 
   const cancel = () => {
@@ -25,7 +51,7 @@ export function SettingsPage() {
     setStatus('idle')
   }
 
-  return (
+  return (<>
     <div style={{ flex: 1, padding: '48px 56px 24px', overflowY: 'auto', background: '#fafaf9' }}>
       <h1 style={{ fontSize: 28, fontWeight: 600, color: '#1a1a1a', letterSpacing: '-0.5px', marginBottom: 24, lineHeight: 1.2 }}>
         Settings
@@ -65,11 +91,17 @@ export function SettingsPage() {
               {status === 'saved' ? 'Saved' : status === 'error' ? 'Couldn’t save your profile. Please try again.' : ''}
             </span>
           </div>
+          {offerRefresh && <div style={{ marginTop: 14, padding: '12px 14px', borderRadius: 8, background: '#f7f3ed', color: '#555', fontSize: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}><span>Generate additional category suggestions?</span><span style={{ display: 'flex', gap: 8, flexShrink: 0 }}><button type="button" onClick={regenerateCategories} style={{ ...smallButton, background: '#1a1a1a', color: '#fff' }}>Suggest</button><button type="button" onClick={() => setOfferRefresh(false)} style={smallButton}>Not now</button></span></div>}
         </form>
       </section>
       <EmailSettings />
     </div>
-  )
+    {starterCategories && <CategoryReview initial={starterCategories} onApply={items => {
+      applyStarterCategories(items)
+      void categorizeExistingItems()
+      setStarterCategories(null)
+    }} onSkip={() => { saveStarterCategoryState('skipped'); setStarterCategories(null) }} />}
+  </>)
 }
 
 function EmailSettings() {

@@ -4,6 +4,7 @@
 //   /classify  → body { text, existing_categories?, category_descriptions? } → { decision, category, description?, reason }
 //   /title     → body { text }                                               → { title }
 //   /subscribe → body { email }                                              → { ok: true }
+//   /starter_categories → body { profile }                                    → { categories }
 //
 // All require:
 //   Header "X-Later-Auth: <SHARED_SECRET env var>"
@@ -202,6 +203,7 @@ export default {
       if (url.pathname === '/reclassify') return await handleReclassify(request, env)
       if (url.pathname === '/title') return await handleTitle(request, env)
       if (url.pathname === '/subscribe') return await handleSubscribe(request, env)
+      if (url.pathname === '/starter_categories') return await handleStarterCategories(request, env)
       if (url.pathname === '/parse_reminder') return await handleParseReminder(request, env)
       return json({ error: 'not found' }, 404)
     } catch (e) {
@@ -457,6 +459,22 @@ function validateClassify(p: Partial<ClassifyResult> | null, cats: string[]): Cl
 }
 
 interface SubscribeBody { email?: string }
+
+const STARTER_TOOL = {
+  name: 'record_categories',
+  description: 'Return starter categories for the user.',
+  input_schema: { type: 'object', properties: { categories: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' } }, required: ['name', 'description'] } } }, required: ['categories'] },
+} as any
+
+async function handleStarterCategories(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json().catch(() => ({}))) as { profile?: string }
+  const profile = (body.profile ?? '').trim().slice(0, 2000)
+  if (!profile) return json({ categories: [] })
+  const result = await callAnthropicWithTool(env.ANTHROPIC_API_KEY, `Create 3 to 6 broad, useful starter categories for this person. Use plain title-case names (1-3 words), avoid duplicates and generic Other or Misc. Each description must be one concise sentence. Profile:\n${profile}`, STARTER_TOOL)
+  const raw = Array.isArray((result as any)?.categories) ? (result as any).categories : []
+  const categories = raw.slice(0, 8).filter((c: any) => c && typeof c.name === 'string' && typeof c.description === 'string').map((c: any) => ({ name: c.name.trim().slice(0, 60), description: c.description.trim().slice(0, 240) })).filter((c: any) => c.name)
+  return json({ categories })
+}
 
 async function handleSubscribe(request: Request, env: Env): Promise<Response> {
   const body = (await request.json().catch(() => ({}))) as SubscribeBody

@@ -1,7 +1,9 @@
 import { useState } from 'react'
 import { loadUserProfile, saveUserProfile, loadUserEmail, saveUserEmail } from '../lib/profile'
+import { CategoryReview } from './CategoryReview'
+import { generateStarterCategories, loadStarterCategoryState, saveStarterCategoryState, categorizeExistingItems, applyStarterCategories, type StarterCategory } from '../lib/starterCategories'
 
-type Step = 'howto' | 'profile' | 'email'
+type Step = 'howto' | 'profile' | 'categories' | 'email'
 
 const CREAM = '#fafaf9'
 const TEXT = '#1a1a1a'
@@ -25,20 +27,32 @@ async function markDone() {
 }
 
 export function Onboarding({ onDone }: { onDone: () => void }) {
+  const replayOnboarding = import.meta.env.DEV && import.meta.env.VITE_FORCE_ONBOARDING === '1'
   const [step, setStep] = useState<Step>('howto')
   const [email, setEmail] = useState(loadUserEmail)
   const [profileText, setProfileText] = useState(() => loadUserProfile().text)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [thanks, setThanks] = useState(false)
+  const [starterCategories, setStarterCategories] = useState<StarterCategory[]>([])
 
   const finish = async () => { await markDone(); onDone() }
 
   // Save profile text (guaranteed non-empty because Continue is disabled on
   // empty input), then advance.
-  const saveProfileAndNext = () => {
+  const saveProfileAndNext = async () => {
     const trimmed = profileText.trim()
     if (trimmed) saveUserProfile(trimmed)
+    let existing: string[] = []
+    try { existing = JSON.parse(localStorage.getItem('later:categories') ?? '[]') } catch { }
+    if (trimmed && (replayOnboarding || (existing.length === 0 && loadStarterCategoryState() === 'not_started'))) {
+      try {
+        const generated = await generateStarterCategories(trimmed)
+        if (generated.length) { setStarterCategories(generated); setStep('categories'); return }
+      } catch { }
+    } else if (trimmed && existing.length > 0) {
+      void categorizeExistingItems()
+    }
     setStep('email')
   }
   // Skip without saving — user opted out. Nothing goes into localStorage.
@@ -86,6 +100,11 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
             onSkip={skipProfile}
           />
         )}
+        {step === 'categories' && <CategoryReview initial={starterCategories} onApply={items => {
+          applyStarterCategories(items)
+          void categorizeExistingItems({ includeCategorized: replayOnboarding })
+          setStep('email')
+        }} onSkip={() => { saveStarterCategoryState('skipped'); setStep('email') }} />}
         {step === 'email' && (
           <EmailCard
             email={email}

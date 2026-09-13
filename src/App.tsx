@@ -137,10 +137,11 @@ function detectType(text: string): ItemType {
 }
 
 export default function App() {
-  const [view, setView] = useState<string>('library')
+  const [view, setView] = useState<string>('home')
   const [links, setLinks] = useState<LinkRow[]>(loadLinks)
   const [search, setSearch] = useState('')
   const [categories, setCategories] = useState<string[]>(loadCategories)
+  const [categorizationProgress, setCategorizationProgress] = useState<{ label: string; done: number; total: number | null } | null>(null)
   const [, setUndoStack] = useState<Snapshot[]>([])
   // Onboarding was previously mounted in the (now-retired) popup window. Now
   // that the vault is the first thing users see, it lives here — shown as an
@@ -197,6 +198,9 @@ export default function App() {
       setCategories(loadCategories())
     }
     window.addEventListener('storage', reload)
+    window.addEventListener('later:categories-updated', reload)
+    const progress = (event: Event) => setCategorizationProgress((event as CustomEvent).detail)
+    window.addEventListener('later:categorization-progress', progress)
     let unlisten: (() => void) | undefined
     ;(async () => {
       try {
@@ -206,6 +210,8 @@ export default function App() {
     })()
     return () => {
       window.removeEventListener('storage', reload)
+      window.removeEventListener('later:categories-updated', reload)
+      window.removeEventListener('later:categorization-progress', progress)
       if (unlisten) unlisten()
     }
   }, [])
@@ -710,6 +716,7 @@ export default function App() {
         onSetReminder={handleSetReminder}
         onClearReminder={handleClearReminder}
       />
+      {categorizationProgress && (categorizationProgress.total === null || categorizationProgress.done < categorizationProgress.total) && <div role="status" style={{ position: 'fixed', right: 22, top: 22, zIndex: 130, background: '#1a1a1a', color: '#fff', borderRadius: 10, padding: '11px 14px', fontSize: 12, boxShadow: '0 6px 24px rgba(0,0,0,.16)' }}>{categorizationProgress.label}{categorizationProgress.total === null ? '' : ` ${categorizationProgress.done}/${categorizationProgress.total}`}</div>}
       {showOnboarding && <Onboarding onDone={() => setShowOnboarding(false)} />}
     </>
   )

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { Fragment, useState, useRef, useEffect } from 'react'
 import type { LinkRow } from '../App'
 import { PendingSuggestionChip } from './PendingSuggestionChip'
 import { loadCategoryDescriptions, saveCategoryDescription } from '../lib/classifier'
@@ -28,6 +28,20 @@ function getDomain(url: string): string {
 function isLongItem(link: LinkRow): boolean {
   const text = link.note || link.title || ''
   return text.length > 100
+}
+
+const DATE_GROUP_THRESHOLD = 12
+
+function dateGroup(iso: string): string {
+  const date = new Date(iso)
+  const now = new Date()
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const startItem = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
+  const days = Math.floor((startToday - startItem) / 86_400_000)
+  if (days <= 0) return 'Today'
+  if (days === 1) return 'Yesterday'
+  if (days < 7) return 'This week'
+  return 'Earlier'
 }
 
 type Props = {
@@ -103,7 +117,7 @@ export function LibraryPage({
   const filtered = links.filter((l) => {
     const matchesView =
       activeView === 'library' ||
-      activeView === 'home' ||
+      (activeView === 'home' && !l.is_done) ||
       (activeView.startsWith('cat:') && l.category === activeView.slice(4))
     const q = search.toLowerCase()
     const matchesSearch = !q ||
@@ -114,9 +128,12 @@ export function LibraryPage({
     return matchesView && matchesSearch
   })
 
-  const undone = filtered.filter(l => !l.is_done)
-  const done = filtered.filter(l => l.is_done)
+  const byNewest = (a: LinkRow, b: LinkRow) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+  const undone = filtered.filter(l => !l.is_done).sort(byNewest)
+  const done = filtered.filter(l => l.is_done).sort(byNewest)
   const sorted = [...undone, ...done]
+  const needsReviewCount = links.filter(l => !l.is_done && l.ai_processed && (!l.category || (l.pending_suggestion && l.pending_suggestion.kind !== 'reasoning'))).length
+  const showDateGroups = activeView === 'home' && !search && sorted.length >= DATE_GROUP_THRESHOLD
 
   // Open-item counts per category, for the sidebar badges
   const categoryCounts: Record<string, number> = {}
@@ -126,7 +143,8 @@ export function LibraryPage({
   }
 
   const getPageTitle = () => {
-    if (activeView === 'library') return 'Home'
+    if (activeView === 'home') return 'Home'
+    if (activeView === 'library') return 'All Items'
     if (activeView.startsWith('cat:')) return activeView.slice(4)
     return 'Items'
   }
@@ -603,7 +621,8 @@ export function LibraryPage({
         <span style={{ fontSize: 22, fontWeight: 900, color: '#1a1a1a', fontFamily: "'Playfair Display', serif", letterSpacing: '-0.3px' }}>Later<span style={{ color: '#2d8a4e' }}>.</span></span>
       </div>
 
-      <button onClick={() => { onNavigate('library'); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '9px 12px', fontSize: 17, marginBottom: 16, fontWeight: activeView === 'library' ? 600 : 500, color: '#1a1a1a', background: activeView === 'library' ? '#eeede9' : 'none', border: 'none', borderRadius: 6, cursor: 'pointer', fontFamily: "'Fraunces', serif" }}>Home</button>
+      <button onClick={() => { onNavigate('home'); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, width: '100%', textAlign: 'left', padding: '9px 12px', fontSize: 17, marginBottom: 4, fontWeight: activeView === 'home' ? 600 : 500, color: '#1a1a1a', background: activeView === 'home' ? '#eeede9' : 'none', border: 'none', borderRadius: 6, cursor: 'pointer', fontFamily: "'Fraunces', serif" }}><span>Home</span>{needsReviewCount > 0 ? <span style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', fontSize: 10, fontWeight: 500, color: '#9a6a42', whiteSpace: 'nowrap' }}>{needsReviewCount} need review</span> : null}</button>
+      <button onClick={() => { onNavigate('library'); setSelectedItem(null); setSelectedIds(new Set()); setLastIndex(null) }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 12px', fontSize: 13, marginBottom: 16, fontWeight: activeView === 'library' ? 600 : 400, color: '#777', background: activeView === 'library' ? '#eeede9' : 'none', border: 'none', borderRadius: 6, cursor: 'pointer', fontFamily: "'Fraunces', serif" }}>All items</button>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 12px', marginBottom: 12 }}>
         <span style={{ fontSize: 15, fontWeight: 600, color: '#9a9a94', fontFamily: "'Fraunces', serif" }}>Categories</span>
         <button onClick={() => setAddingCat(true)} style={{ width: 18, height: 18, borderRadius: 4, border: '1px solid #d8d8d4', background: 'none', cursor: 'pointer', fontSize: 14, color: '#aaa', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'inherit', padding: 0 }}>+</button>
@@ -729,9 +748,13 @@ export function LibraryPage({
             const dropdownOpen = openDropdownId === link.id
             const isLong = isLongItem(link)
             const value = edits[link.id] !== undefined ? edits[link.id] : (link.title ?? '')
+            const group = activeView === 'library' && link.is_done ? 'Completed' : showDateGroups ? dateGroup(link.created_at) : null
+            const previous = sorted[index - 1]
+            const previousGroup = !previous ? null : activeView === 'library' && previous.is_done ? 'Completed' : showDateGroups ? dateGroup(previous.created_at) : null
             return (
+              <Fragment key={link.id}>
+              {group && group !== previousGroup ? <div style={{ margin: index === 0 ? '0 0 8px 34px' : '20px 0 8px 34px', color: '#aaa', fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.06em' }}>{group}</div> : null}
               <div
-                key={link.id}
                 onMouseDown={e => handleRowMouseDown(link, index, e)}
                 onMouseEnter={() => setHoveredItemId(link.id)}
                 onMouseLeave={() => { if (!dropdownOpen) setHoveredItemId(null) }}
@@ -741,7 +764,7 @@ export function LibraryPage({
                   // cream blocks touch and merge into one continuous fill.
                   padding: '0 8px',
                   borderRadius: 6,
-                  background: 'transparent',
+                  background: isHovered || dropdownOpen ? '#f5f4f1' : 'transparent',
                   transition: 'background 0.1s',
                   opacity: link.is_done ? 0.45 : 1,
                 }}
@@ -772,6 +795,7 @@ export function LibraryPage({
                       minWidth: 0, flex: 1,
                     }}
                   />
+                  {!link.ai_processed && <span style={{ flexShrink: 0, fontSize: 12, color: '#999', background: '#f4f1eb', borderRadius: 999, padding: '3px 8px' }}>Organising…</span>}
                   {isLong && (
                     <button
                       onMouseDown={e => e.stopPropagation()}
@@ -880,14 +904,14 @@ export function LibraryPage({
                       </div>
                     )
                   })()}
-                  {!link.pending_suggestion && (isHovered || dropdownOpen) && !hideCategoryUI && (
+                  {link.ai_processed && !link.pending_suggestion && !hideCategoryUI && (
                     <div style={{ position: 'relative', flexShrink: 0 }}>
                       <button
                         onMouseDown={e => e.stopPropagation()}
                         onClick={e => { e.stopPropagation(); setOpenDropdownId(dropdownOpen ? null : link.id); setAddingCatInline(false); setInlineCatValue('') }}
                         style={{ fontSize: 12, color: link.category ? '#888' : '#bbb', background: dropdownOpen ? '#e8e8e4' : '#eeede9', border: 'none', cursor: 'pointer', padding: '2px 7px', borderRadius: 4, fontFamily: 'inherit', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 3 }}
                       >
-                        {link.category || 'Category'}<span style={{ fontSize: 9, color: '#bbb' }}>▾</span>
+                        {link.category || 'Choose category'}<span aria-hidden="true" style={{ fontSize: 11, color: '#777', lineHeight: 1, marginLeft: 2 }}>⌄</span>
                       </button>
                       {dropdownOpen && (
                         <div ref={dropdownRef} style={{ position: 'absolute', left: 0, top: '100%', marginTop: 4, background: '#fff', border: '1px solid #e8e8e4', borderRadius: 10, boxShadow: '0 6px 20px rgba(0,0,0,0.10)', width: 200, zIndex: 100, overflow: 'hidden' }}>
@@ -908,6 +932,7 @@ export function LibraryPage({
                   )}
                 </div>
               </div>
+              </Fragment>
             )
           })}
 
