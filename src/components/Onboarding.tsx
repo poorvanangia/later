@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { loadUserProfile, saveUserProfile } from '../lib/profile'
+import { loadUserProfile, saveUserProfile, loadUserEmail, saveUserEmail } from '../lib/profile'
 
 type Step = 'howto' | 'profile' | 'email'
 
@@ -26,7 +26,7 @@ async function markDone() {
 
 export function Onboarding({ onDone }: { onDone: () => void }) {
   const [step, setStep] = useState<Step>('howto')
-  const [email, setEmail] = useState('')
+  const [email, setEmail] = useState(loadUserEmail)
   const [profileText, setProfileText] = useState(() => loadUserProfile().text)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -55,6 +55,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
     setError(null)
     try {
       const { invoke } = await import('@tauri-apps/api/core')
+      saveUserEmail(trimmed)
       await invoke('submit_email', { email: trimmed })
       setThanks(true)
       setTimeout(finish, 900)
