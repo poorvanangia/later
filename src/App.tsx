@@ -146,7 +146,9 @@ export default function App() {
   // that the vault is the first thing users see, it lives here — shown as an
   // overlay when the completion marker is missing.
   const [showOnboarding, setShowOnboarding] = useState(() => {
-    try { return WINDOW_LABEL === 'library' && !localStorage.getItem('later:onboardingComplete') } catch { return false }
+    if (WINDOW_LABEL !== 'library') return false
+    if (import.meta.env.DEV && import.meta.env.VITE_FORCE_ONBOARDING === '1') return true
+    try { return !localStorage.getItem('later:onboardingComplete') } catch { return false }
   })
 
   const aiCategories = [...new Set(links.map(l => l.category).filter(Boolean) as string[])]

@@ -920,8 +920,10 @@ pub fn run() {
             let marker_present = first_launch_marker_path(&app.handle())
                 .map(|p| p.exists())
                 .unwrap_or(true);
-            if !marker_present {
-                eprintln!("[later] first-launch marker missing — will auto-open library");
+            let replay_onboarding = cfg!(debug_assertions)
+                && std::env::var("VITE_FORCE_ONBOARDING").as_deref() == Ok("1");
+            if !marker_present || replay_onboarding {
+                eprintln!("[later] onboarding launch — will auto-open library");
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(500));

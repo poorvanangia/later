@@ -69,6 +69,16 @@ npm run build        # Type-check and build the frontend
 npm run tauri:dev    # Launch the desktop app
 ```
 
+### Replay onboarding during development
+
+```bash
+npm run tauri:dev:onboarding
+```
+
+This sets `VITE_FORCE_ONBOARDING=1`, opens the library, and shows onboarding on every launch even if it was completed before. Tasks, categories, and completion markers are not reset. Profile edits and email submission still work normally; skip those steps to leave them unchanged. Quit the current dev run before switching commands.
+
+Use `npm run tauri:dev` to return to normal launch behavior. The override is disabled in production builds.
+
 The `npm run release` entry currently references a missing `scripts/release.sh`; use `npm run tauri:build` for desktop builds.
 
 ## License
