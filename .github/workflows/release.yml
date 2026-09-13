@@ -85,8 +85,11 @@ jobs:
       # Tauri's built-in DMG bundler doesn't apply our custom background/icon
       # layout in CI's headless environment (works fine locally). Use create-dmg
       # instead — matches what scripts/release.sh did before it was removed.
+      # This is andreyvit/create-dmg (Bash), installed via Homebrew — NOT the
+      # sindresorhus/create-dmg npm package, which has an entirely different CLI.
       - name: Build .dmg with create-dmg
         run: |
+          brew install create-dmg
           mkdir -p src-tauri/target/release/bundle/dmg
           npm run dmg:build
           VERSION="${GITHUB_REF_NAME#v}"
