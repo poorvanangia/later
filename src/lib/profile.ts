@@ -1,10 +1,10 @@
 // User profile — a free-text description of who the user is and what they do.
-// Captured during onboarding, editable later (settings page — task #10).
+// Captured during onboarding, editable in Settings → About you.
 // Injected into every classifier call so decisions are informed by the user's
 // context rather than generic guesses.
 //
-// Stored as a small object rather than a bare string so a future settings
-// page can extend the shape (e.g. add a `role_tags: string[]` or
+// Stored as a small object rather than a bare string so settings
+// can extend the shape (e.g. add a `role_tags: string[]` or
 // `preferred_categories: string[]` field) without a migration.
 
 const K_PROFILE = 'later:user_profile'
@@ -33,7 +33,7 @@ export function saveUserProfile(text: string): UserProfile {
     text: text.trim(),
     updatedAt: new Date().toISOString(),
   }
-  try { localStorage.setItem(K_PROFILE, JSON.stringify(next)) } catch { }
+  try { localStorage.setItem(K_PROFILE, JSON.stringify(next)) } catch { /* Settings verifies persistence before showing success. */ }
   return next
 }
 
@@ -42,4 +42,15 @@ export function saveUserProfile(text: string): UserProfile {
 // that only need the text don't have to deconstruct the object.
 export function loadUserProfileText(): string {
   return loadUserProfile().text
+}
+
+// Kept separate from AI profile text: email is not classifier context.
+const K_EMAIL = 'later:user_email'
+
+export function loadUserEmail(): string {
+  try { return localStorage.getItem(K_EMAIL) ?? '' } catch { return '' }
+}
+
+export function saveUserEmail(email: string): void {
+  localStorage.setItem(K_EMAIL, email.trim())
 }

@@ -17,8 +17,6 @@ import {
 } from './lib/classifier'
 import { loadUserProfileText } from './lib/profile'
 import { scheduleReminderNative, cancelReminderNative } from './lib/reminders'
-import { startPollLoop } from './lib/gmailSync'
-import { loadOpenLoops, markAccepted, markRejected, loadGmailHistoryId, type OpenLoop } from './lib/openloops'
 
 const SYNC_EVENT = 'later://state-changed'
 
@@ -136,23 +134,19 @@ function detectType(text: string): ItemType {
 }
 
 export default function App() {
-  const [view, setView] = useState<string>('library')
+  const [view, setView] = useState<string>('home')
   const [links, setLinks] = useState<LinkRow[]>(loadLinks)
   const [search, setSearch] = useState('')
   const [categories, setCategories] = useState<string[]>(loadCategories)
-  const [openLoops, setOpenLoops] = useState<OpenLoop[]>(loadOpenLoops)
+  const [categorizationProgress, setCategorizationProgress] = useState<{ label: string; done: number; total: number | null } | null>(null)
   const [, setUndoStack] = useState<Snapshot[]>([])
-  // "First-run nudge" state — persisted so it survives reloads. Semantics
-  // (matches spec): show banner only on a fresh 0→N transition; dismiss
-  // silently until count returns to 0.
-  const [nudgeDismissed, setNudgeDismissed] = useState<boolean>(() =>
-    localStorage.getItem('later:openloops_nudge_dismissed') === '1'
-  )
   // Onboarding was previously mounted in the (now-retired) popup window. Now
   // that the vault is the first thing users see, it lives here — shown as an
   // overlay when the completion marker is missing.
   const [showOnboarding, setShowOnboarding] = useState(() => {
-    try { return WINDOW_LABEL === 'library' && !localStorage.getItem('later:onboardingComplete') } catch { return false }
+    if (WINDOW_LABEL !== 'library') return false
+    if (import.meta.env.DEV && import.meta.env.VITE_FORCE_ONBOARDING === '1') return true
+    try { return !localStorage.getItem('later:onboardingComplete') } catch { return false }
   })
 
   const aiCategories = [...new Set(links.map(l => l.category).filter(Boolean) as string[])]
@@ -193,16 +187,17 @@ export default function App() {
   }, [])
 
   // Reload from localStorage on storage event (other browser tabs) OR Tauri
-  // event (other Tauri windows in this same app). Also pulls the open-loops
-  // queue in — it lives in the same shared localStorage and syncs the same way.
+  // event (other Tauri windows in this same app).
   useEffect(() => {
     const reload = () => {
       console.log('[later] sync: reloading from localStorage')
       setLinks(loadLinks())
       setCategories(loadCategories())
-      setOpenLoops(loadOpenLoops())
     }
     window.addEventListener('storage', reload)
+    window.addEventListener('later:categories-updated', reload)
+    const progress = (event: Event) => setCategorizationProgress((event as CustomEvent).detail)
+    window.addEventListener('later:categorization-progress', progress)
     let unlisten: (() => void) | undefined
     ;(async () => {
       try {
@@ -212,25 +207,11 @@ export default function App() {
     })()
     return () => {
       window.removeEventListener('storage', reload)
+      window.removeEventListener('later:categories-updated', reload)
+      window.removeEventListener('later:categorization-progress', progress)
       if (unlisten) unlisten()
     }
   }, [])
-
-  // Nudge-reset effect: whenever the open-loops count hits zero, clear the
-  // dismissed flag so the NEXT 0→N transition surfaces the banner again.
-  // (Setting on rise is done inline in the banner render — no effect needed
-  // since we always compute "should show" from count + dismissed.)
-  const openLoopsCount = openLoops.filter(l => l.status === 'open').length
-  useEffect(() => {
-    if (openLoopsCount === 0 && nudgeDismissed) {
-      setNudgeDismissed(false)
-      localStorage.removeItem('later:openloops_nudge_dismissed')
-    }
-  }, [openLoopsCount, nudgeDismissed])
-  const dismissNudge = () => {
-    setNudgeDismissed(true)
-    localStorage.setItem('later:openloops_nudge_dismissed', '1')
-  }
 
   // Check for app updates once per library-window mount. Gated to the library
   // window because the spotlight pops up many times a day — a confirm dialog
@@ -546,11 +527,8 @@ export default function App() {
   }, [])
 
   // Deep-link save handler. Fires when the Chrome extension shoots a
-  // `later://save?…` URL at us — with an email's subject / sender / thread IDs
-  // encoded as query params. The ref indirection is deliberate: the listener
-  // is registered once on mount, but the handler reads state (mutateLinks,
-  // classifyItem) that changes every render. Assigning `.current` fresh each
-  // render keeps the handler pointing at the latest closures.
+  // later://save?… URL at us. The ref indirection keeps the listener bound
+  // once while the handler always sees the latest mutateLinks/classifyItem.
   const handleDeepLinkRef = useRef<(url: string) => void>(() => {})
   handleDeepLinkRef.current = (rawUrl: string) => {
     let parsed: URL
@@ -559,8 +537,6 @@ export default function App() {
       return
     }
     if (parsed.protocol !== 'later:') return
-    // Currently only later://save is defined. Ignore other paths silently so
-    // future scheme routes don't accidentally match this handler.
     if (parsed.host !== 'save') {
       console.log('[later] deep-link: unhandled route', parsed.host)
       return
@@ -571,9 +547,6 @@ export default function App() {
     if (kind === 'linkedin') {
       const title = params.get('title')?.trim() || 'LinkedIn post'
       const author = params.get('author')?.trim() || ''
-      // LinkedIn's current DOM hides post permalinks, so v1 saves fall back to
-      // the feed root — badge remains clickable but goes to LinkedIn home, not
-      // the specific post. Revisit when we have URN extraction working.
       const url = params.get('url')?.trim() || 'https://www.linkedin.com/feed/'
       const postUrn = params.get('postUrn')?.trim() || ''
       const id = `link-${Date.now()}`
@@ -606,35 +579,14 @@ export default function App() {
       : (senderName || senderEmail || null)
     const id = `link-${Date.now()}`
     const newLink: LinkRow = {
-      id,
-      url: gmailUrl,
-      title,
-      note: noteText,
-      category: null,
-      label: null,
-      read_time_minutes: null,
-      intent: null,
-      is_done: false,
-      // Mark ai_processed=true here — Gmail items skip the fetchTitle/OG pass
-      // (there's no page metadata to scrape), so we don't want the shimmer
-      // "still loading" affordance the row shows while ai_processed is false.
-      ai_processed: true,
-      created_at: new Date().toISOString(),
+      id, url: gmailUrl, title, note: noteText,
+      category: null, label: null, read_time_minutes: null, intent: null,
+      is_done: false, ai_processed: true, created_at: new Date().toISOString(),
       item_type: 'link',
-      source_ref: {
-        kind: 'gmail',
-        thread_id: threadId,
-        message_id: messageId,
-        url: gmailUrl,
-      },
-      remind_at: null,
-      fired_at: null,
-      acknowledged_at: null,
+      source_ref: { kind: 'gmail', thread_id: threadId, message_id: messageId, url: gmailUrl },
+      remind_at: null, fired_at: null, acknowledged_at: null,
     }
     mutateLinks(prev => [newLink, ...prev])
-    // Classifier gets subject + sender since sender often carries category
-    // signal ("Airbnb" → travel; a colleague's name → work). Matches the "same
-    // AI logic as any other item" contract in the extension spec.
     const classifierText = senderName ? `${title} — from ${senderName}` : title
     setTimeout(() => classifyItem(id, classifierText), 100)
   }
@@ -646,9 +598,6 @@ export default function App() {
       try {
         const { invoke } = await import('@tauri-apps/api/core')
         const { listen } = await import('@tauri-apps/api/event')
-        // Drain any URLs the OS delivered before React was ready (cold start
-        // via later://…). frontend_ready also flips a Rust flag so subsequent
-        // deliveries emit straight to us via the event below.
         const pending = await invoke<string[]>('frontend_ready')
         for (const url of pending) handleDeepLinkRef.current(url)
         unlisten = await listen<string>('later://deep-link', event => {
@@ -662,65 +611,6 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Gmail poll loop — only in the library window (single owner) and only for
-  // the lifetime of that window. If the user closes and reopens the library,
-  // the loop restarts fresh; the sync cursor in localStorage means we don't
-  // re-process anything either way.
-  useEffect(() => {
-    if (WINDOW_LABEL !== 'library') return
-    const stop = startPollLoop()
-    return () => { stop() }
-  }, [])
-
-  // Accept an OpenLoop → real LinkRow. Runs through the same classifier path
-  // manual saves take, so Gmail-extracted items land in the same categories.
-  // If the OpenLoop carries a due_at, we schedule a reminder in the same
-  // motion — the reminder system doesn't care whether the item's source is
-  // the user typing or Gmail extraction.
-  const handleAcceptOpenLoop = (loop: OpenLoop) => {
-    const id = `link-${Date.now()}`
-    const newLink: LinkRow = {
-      id,
-      url: loop.summary,   // note-shaped item — no URL to fetch
-      title: loop.summary,
-      note: loop.summary,
-      category: null,
-      label: null,
-      read_time_minutes: null,
-      intent: null,
-      is_done: false,
-      ai_processed: false,
-      created_at: new Date().toISOString(),
-      item_type: 'note',
-      source_ref: {
-        kind: 'gmail',
-        thread_id: loop.source_thread_id,
-        message_id: loop.source_message_id,
-        url: loop.gmail_url,
-      },
-      remind_at: loop.due_at ?? null,
-      fired_at: null,
-      acknowledged_at: null,
-    }
-    mutateLinks(prev => [newLink, ...prev])
-    // Kick classification the same way handleSave does for note-type items.
-    setTimeout(() => classifyItem(id, loop.summary), 100)
-    // If we have a due date, wire the reminder — matches how handleSetReminder
-    // schedules for manually-set ones.
-    if (loop.due_at) {
-      scheduleReminderNative(id, loop.summary, loop.due_at)
-    }
-    markAccepted(loop.id, id)
-    setOpenLoops(loadOpenLoops())  // eager local refresh; sync event will confirm
-  }
-
-  const handleRejectOpenLoop = (loop: OpenLoop) => {
-    // Anchor the rejection to the current sync cursor so the extraction path
-    // can re-surface this thread ONLY if it gains new content past this point.
-    const historyId = loadGmailHistoryId() ?? ''
-    markRejected(loop.id, historyId)
-    setOpenLoops(loadOpenLoops())
-  }
 
   const handleRejectSuggestion = (id: string) => {
     const link = links.find(l => l.id === id)
@@ -908,13 +798,8 @@ export default function App() {
         onRejectSuggestion={handleRejectSuggestion}
         onSetReminder={handleSetReminder}
         onClearReminder={handleClearReminder}
-        openLoopsCount={openLoopsCount}
-        openLoops={openLoops}
-        onAcceptOpenLoop={handleAcceptOpenLoop}
-        onRejectOpenLoop={handleRejectOpenLoop}
-        showOpenLoopsNudge={openLoopsCount > 0 && !nudgeDismissed}
-        onDismissOpenLoopsNudge={dismissNudge}
       />
+      {categorizationProgress && (categorizationProgress.total === null || categorizationProgress.done < categorizationProgress.total) && <div role="status" style={{ position: 'fixed', right: 22, top: 22, zIndex: 130, background: '#1a1a1a', color: '#fff', borderRadius: 10, padding: '11px 14px', fontSize: 12, boxShadow: '0 6px 24px rgba(0,0,0,.16)' }}>{categorizationProgress.label}{categorizationProgress.total === null ? '' : ` ${categorizationProgress.done}/${categorizationProgress.total}`}</div>}
       {showOnboarding && <Onboarding onDone={() => setShowOnboarding(false)} />}
     </>
   )
