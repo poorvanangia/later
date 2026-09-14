@@ -20,6 +20,11 @@
         "https://github.com/poorvanangia/later/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYzOTY0RkI5ODc2MzY5NDMKUldSRGFXT0h1VStXWStrd0lVcnlYZk5DMHoyY3FhcGhiV1AvYmpMMzd0ZnZSUFJPVEFYWXYzdFkK"
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": ["later"]
+      }
     }
   },
   "bundle": {

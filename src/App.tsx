@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { LibraryPage } from './components/LibraryPage'
 import { SpotlightBar } from './components/SpotlightBar'
 import { Onboarding } from './components/Onboarding'
@@ -86,12 +86,9 @@ export type LinkRow = {
   source_ref?: LinkSourceRef | null
 }
 
-export type LinkSourceRef = {
-  kind: 'gmail'
-  thread_id: string
-  message_id: string
-  url: string     // pre-computed deep link, so the UI never needs Gmail's URL scheme
-}
+export type LinkSourceRef =
+  | { kind: 'gmail'; thread_id: string; message_id: string; url: string }
+  | { kind: 'linkedin'; post_urn: string; url: string }
 
 function loadLinks(): LinkRow[] {
   try {
@@ -528,6 +525,92 @@ export default function App() {
     return () => { if (unlisten) unlisten() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Deep-link save handler. Fires when the Chrome extension shoots a
+  // later://save?… URL at us. The ref indirection keeps the listener bound
+  // once while the handler always sees the latest mutateLinks/classifyItem.
+  const handleDeepLinkRef = useRef<(url: string) => void>(() => {})
+  handleDeepLinkRef.current = (rawUrl: string) => {
+    let parsed: URL
+    try { parsed = new URL(rawUrl) } catch (e) {
+      console.warn('[later] deep-link: bad URL', rawUrl, e)
+      return
+    }
+    if (parsed.protocol !== 'later:') return
+    if (parsed.host !== 'save') {
+      console.log('[later] deep-link: unhandled route', parsed.host)
+      return
+    }
+    const params = parsed.searchParams
+    const kind = params.get('kind') || 'gmail'
+
+    if (kind === 'linkedin') {
+      const title = params.get('title')?.trim() || 'LinkedIn post'
+      const author = params.get('author')?.trim() || ''
+      const url = params.get('url')?.trim() || 'https://www.linkedin.com/feed/'
+      const postUrn = params.get('postUrn')?.trim() || ''
+      const id = `link-${Date.now()}`
+      const newLink: LinkRow = {
+        id, url, title, note: author || null,
+        category: null, label: null, read_time_minutes: null, intent: null,
+        is_done: false, ai_processed: true, created_at: new Date().toISOString(),
+        item_type: 'link',
+        source_ref: { kind: 'linkedin', post_urn: postUrn, url },
+        remind_at: null, fired_at: null, acknowledged_at: null,
+      }
+      mutateLinks(prev => [newLink, ...prev])
+      const classifierText = author ? `${title} — from ${author}` : title
+      setTimeout(() => classifyItem(id, classifierText), 100)
+      return
+    }
+
+    const title = params.get('title')?.trim() || 'Untitled email'
+    const senderName = params.get('sender')?.trim() || ''
+    const senderEmail = params.get('senderEmail')?.trim() || ''
+    const threadId = params.get('threadId')?.trim() || ''
+    const messageId = params.get('messageId')?.trim() || ''
+    const gmailUrl = params.get('gmailUrl')?.trim() || ''
+    if (!threadId || !gmailUrl) {
+      console.warn('[later] deep-link save: missing threadId/gmailUrl', rawUrl)
+      return
+    }
+    const noteText = senderName && senderEmail
+      ? `${senderName} <${senderEmail}>`
+      : (senderName || senderEmail || null)
+    const id = `link-${Date.now()}`
+    const newLink: LinkRow = {
+      id, url: gmailUrl, title, note: noteText,
+      category: null, label: null, read_time_minutes: null, intent: null,
+      is_done: false, ai_processed: true, created_at: new Date().toISOString(),
+      item_type: 'link',
+      source_ref: { kind: 'gmail', thread_id: threadId, message_id: messageId, url: gmailUrl },
+      remind_at: null, fired_at: null, acknowledged_at: null,
+    }
+    mutateLinks(prev => [newLink, ...prev])
+    const classifierText = senderName ? `${title} — from ${senderName}` : title
+    setTimeout(() => classifyItem(id, classifierText), 100)
+  }
+
+  useEffect(() => {
+    if (WINDOW_LABEL !== 'library') return
+    let unlisten: (() => void) | undefined
+    ;(async () => {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core')
+        const { listen } = await import('@tauri-apps/api/event')
+        const pending = await invoke<string[]>('frontend_ready')
+        for (const url of pending) handleDeepLinkRef.current(url)
+        unlisten = await listen<string>('later://deep-link', event => {
+          handleDeepLinkRef.current(event.payload)
+        })
+      } catch (e) {
+        console.warn('[later] deep-link setup failed (probably not in Tauri)', e)
+      }
+    })()
+    return () => { if (unlisten) unlisten() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
 
   const handleRejectSuggestion = (id: string) => {
     const link = links.find(l => l.id === id)

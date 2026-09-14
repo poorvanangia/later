@@ -8,6 +8,14 @@ export const supabase = createClient(
   supabaseAnonKey || 'placeholder'
 )
 
+// Provenance for items created from external sources (currently Gmail, via the
+// browser extension's later://save deep link). Kept as a small discriminated
+// union so a new source just adds a `kind` — the LinkRow itself doesn't grow a
+// source-specific field set. Mirrors the shape defined in App.tsx.
+export type LinkSourceRef =
+  | { kind: 'gmail'; thread_id: string; message_id: string; url: string }
+  | { kind: 'linkedin'; post_urn: string; url: string }
+
 export type LinkRow = {
   id: string
   user_id: string
@@ -21,4 +29,5 @@ export type LinkRow = {
   is_done: boolean
   ai_processed: boolean
   created_at: string
+  source_ref?: LinkSourceRef | null
 }

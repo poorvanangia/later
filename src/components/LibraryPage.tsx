@@ -25,6 +25,35 @@ function getDomain(url: string): string {
   catch { return '' }
 }
 
+const GmailIcon = () => (
+  <svg width="18" height="14" viewBox="0 0 20 16" fill="none" aria-label="Gmail">
+    <rect x="0.75" y="0.75" width="18.5" height="14.5" rx="2.5" fill="#fff" stroke="#dcdcd6"/>
+    <path d="M2 3.5L10 9L18 3.5" stroke="#ea4335" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/>
+  </svg>
+)
+
+const LinkedInIcon = () => (
+  <svg width="18" height="14" viewBox="0 0 20 16" fill="none" aria-label="LinkedIn">
+    <rect x="0.5" y="0.5" width="19" height="15" rx="2.5" fill="#666"/>
+    <circle cx="5.4" cy="5" r="1.15" fill="#fff"/>
+    <rect x="4.5" y="7" width="1.8" height="5.2" fill="#fff"/>
+    <path d="M8.4 7h1.75v0.85c0.42-0.6 1.15-1.02 2-1.02 1.75 0 2.45 1.1 2.45 2.85V12.2h-1.9V9.9c0-0.78-0.3-1.3-1-1.3s-1.05 0.55-1.05 1.3V12.2H8.4V7z" fill="#fff"/>
+  </svg>
+)
+
+function senderFromNote(note: string | null | undefined): string | null {
+  if (!note) return null
+  const m = note.match(/^(.+?)\s*<[^>]+>$/)
+  return (m ? m[1] : note).trim() || null
+}
+
+// Tauri v2 webviews swallow <a target="_blank"> — clicks are silent no-ops. Use
+// the shell plugin so the URL opens in the OS default browser instead.
+async function openExternal(url: string) {
+  try { (await import('@tauri-apps/plugin-shell')).open(url) }
+  catch { window.open(url, '_blank') }
+}
+
 function isLongItem(link: LinkRow): boolean {
   const text = link.note || link.title || ''
   return text.length > 100
@@ -782,6 +811,19 @@ export function LibraryPage({
                   background: isInSelection ? '#f3dcaa' : 'transparent',
                   transition: 'background 0.1s',
                 }}>
+                  {(link.source_ref?.kind === 'gmail' || link.source_ref?.kind === 'linkedin') && (
+                    <button
+                      onMouseDown={e => e.stopPropagation()}
+                      onClick={e => { e.stopPropagation(); openExternal(link.source_ref!.url) }}
+                      title={link.source_ref.kind === 'gmail' ? 'Open in Gmail' : 'Open on LinkedIn'}
+                      style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', display: 'inline-flex', alignItems: 'center', flexShrink: 0 }}
+                    >{link.source_ref.kind === 'gmail' ? <GmailIcon /> : <LinkedInIcon />}</button>
+                  )}
+                  {(link.source_ref?.kind === 'gmail' || link.source_ref?.kind === 'linkedin') && senderFromNote(link.note) && (
+                    <span style={{ fontSize: 15, color: '#888', flexShrink: 0, whiteSpace: 'nowrap' }}>
+                      {senderFromNote(link.note)} —
+                    </span>
+                  )}
                   <input
                     ref={el => { inputRefs.current[link.id] = el }}
                     value={value}
@@ -975,9 +1017,21 @@ export function LibraryPage({
           {selectedItem.category && <span style={{ fontSize: 12, color: '#888', background: '#eeede9', padding: '3px 8px', borderRadius: 4 }}>{selectedItem.category}</span>}
           <span style={{ fontSize: 12, color: '#ccc' }}>{new Date(selectedItem.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
         </div>
-        <h2 style={{ fontSize: 22, fontWeight: 600, color: '#1a1a1a', letterSpacing: '-0.4px', marginBottom: 24, lineHeight: 1.3 }}>{selectedItem.title || getDomain(selectedItem.url) || selectedItem.url}</h2>
-        {selectedItem.note && <div style={{ fontSize: 15, color: '#333', lineHeight: 1.8, whiteSpace: 'pre-wrap', fontFamily: 'inherit' }}>{selectedItem.note}</div>}
-        {selectedItem.item_type === 'link' && selectedItem.url && <a href={selectedItem.url} target="_blank" rel="noopener noreferrer" style={{ display: 'inline-block', marginTop: 24, fontSize: 13, color: '#888', textDecoration: 'none', borderBottom: '1px solid #e0e0dc', paddingBottom: 2 }}>{selectedItem.url} ↗</a>}
+        <h2 style={{ fontSize: 22, fontWeight: 600, color: '#1a1a1a', letterSpacing: '-0.4px', marginBottom: 24, lineHeight: 1.3, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          {(selectedItem.source_ref?.kind === 'gmail' || selectedItem.source_ref?.kind === 'linkedin') && (
+            <button
+              onClick={() => openExternal(selectedItem.source_ref!.url)}
+              title={selectedItem.source_ref.kind === 'gmail' ? 'Open in Gmail' : 'Open on LinkedIn'}
+              style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', display: 'inline-flex', alignItems: 'center' }}
+            >{selectedItem.source_ref.kind === 'gmail' ? <GmailIcon /> : <LinkedInIcon />}</button>
+          )}
+          {(selectedItem.source_ref?.kind === 'gmail' || selectedItem.source_ref?.kind === 'linkedin') && senderFromNote(selectedItem.note) && (
+            <span style={{ color: '#666', fontWeight: 500 }}>{senderFromNote(selectedItem.note)} —</span>
+          )}
+          <span>{selectedItem.title || getDomain(selectedItem.url) || selectedItem.url}</span>
+        </h2>
+        {selectedItem.note && selectedItem.source_ref?.kind !== 'gmail' && selectedItem.source_ref?.kind !== 'linkedin' && <div style={{ fontSize: 15, color: '#333', lineHeight: 1.8, whiteSpace: 'pre-wrap', fontFamily: 'inherit' }}>{selectedItem.note}</div>}
+        {selectedItem.item_type === 'link' && selectedItem.url && <button onClick={() => openExternal(selectedItem.url)} style={{ display: 'inline-block', marginTop: 24, fontSize: 13, color: '#888', background: 'none', border: 'none', borderBottom: '1px solid #e0e0dc', paddingBottom: 2, paddingLeft: 0, paddingRight: 0, cursor: 'pointer', fontFamily: 'inherit' }}>{selectedItem.source_ref?.kind === 'gmail' ? 'Open in Gmail' : selectedItem.source_ref?.kind === 'linkedin' ? 'Open on LinkedIn' : selectedItem.url} ↗</button>}
       </div>
       <div style={{ padding: '12px 40px', borderTop: '1px solid #eeeee9', display: 'flex', justifyContent: 'flex-end' }}>
         <button onClick={() => { toggleDone(selectedItem); setSelectedItem(null) }} style={{ fontSize: 13, color: selectedItem.is_done ? '#2d8a4e' : '#888', background: 'none', border: '1px solid #e0e0dc', borderRadius: 7, padding: '6px 14px', cursor: 'pointer', fontFamily: 'inherit' }}>{selectedItem.is_done ? '✓ Done' : 'Mark as done'}</button>
