@@ -22,10 +22,3 @@ tokio = { version = "1", features = ["full"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-notification = "2"
-# Gmail OAuth (PKCE) — sha256 for the code_challenge, base64 for verifier +
-# challenge encoding, rand for verifier + state randomness, keyring for
-# macOS Keychain storage of the refresh_token.
-sha2 = "0.10"
-base64 = "0.22"
-rand = "0.8"
-keyring = { version = "3", features = ["apple-native"] }

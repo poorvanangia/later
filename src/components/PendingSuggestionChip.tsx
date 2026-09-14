@@ -55,7 +55,7 @@ export function PendingSuggestionChip({ suggestion, onAccept, onReject }: Props)
           maxWidth: 160,
         }}
       >
-        {label}
+        Suggested: {label}
       </span>
       <button
         onClick={e => { e.preventDefault(); e.stopPropagation(); onAccept() }}
@@ -107,7 +107,7 @@ function ThinkingChip({ fallback }: { fallback: string }) {
           animation: 'later-spin 0.9s linear infinite',
         }}
       />
-      <span>Thinking…</span>
+      <span>Organising…</span>
       <style>{`@keyframes later-spin { to { transform: rotate(360deg); } }`}</style>
     </div>
   )

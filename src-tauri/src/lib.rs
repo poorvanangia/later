@@ -8,8 +8,6 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
-mod gmail_config;
-mod gmail_oauth;
 
 // Registry of in-flight reminder tasks. Each entry is a JoinHandle we can
 // abort when the user cancels or replaces a reminder. Keyed by link id.
@@ -263,6 +261,23 @@ async fn generate_title(text: String) -> String {
     let title = json["title"].as_str().unwrap_or("").trim().to_string();
     eprintln!("[later] generate_title → {:?}", title);
     title
+}
+
+#[tauri::command]
+async fn generate_starter_categories(profile: String) -> Vec<serde_json::Value> {
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build() { Ok(c) => c, Err(_) => return vec![] };
+    let body = serde_json::json!({ "profile": profile.trim() });
+    let url = format!("{}/starter_categories", LATER_API_BASE);
+    let res = match client.post(&url).header("X-Later-Auth", LATER_API_KEY).header("content-type", "application/json").json(&body).send().await { Ok(r) => r, Err(_) => return vec![] };
+    if !res.status().is_success() { return vec![] }
+    match res.json::<serde_json::Value>().await { Ok(v) => v["categories"].as_array().cloned().unwrap_or_default(), Err(_) => vec![] }
+}
+
+#[tauri::command]
+fn log_dev_cache_hit(kind: String, detail: String) {
+    if cfg!(debug_assertions) {
+        eprintln!("[later] using cached {} result{}", kind, detail);
+    }
 }
 
 #[tauri::command]
@@ -557,162 +572,6 @@ async fn open_item_from_reminder(app: tauri::AppHandle, link_id: String) {
     advance_queue(&app);
 }
 
-// ---------- Gmail commands ----------
-//
-// connect_gmail runs the whole loopback OAuth dance (see gmail_oauth.rs)
-// and stores the refresh_token in the macOS Keychain. Returns the connected
-// account's email address on success. The frontend never sees the token.
-//
-// disconnect_gmail wipes the keychain entry. Doesn't revoke on Google's side
-// — that's the user's job in their Google Account settings, and doing it
-// programmatically requires an extra scope we don't want.
-//
-// gmail_connection_status is a cheap check the Settings page hits on mount
-// so it can show "Connected" without waiting for a full round-trip.
-#[tauri::command]
-async fn connect_gmail() -> Result<gmail_oauth::ConnectOk, gmail_oauth::ConnectError> {
-    gmail_oauth::run_connect_flow().await
-}
-
-#[tauri::command]
-async fn disconnect_gmail() -> Result<(), gmail_oauth::ConnectError> {
-    gmail_oauth::disconnect()
-}
-
-#[tauri::command]
-async fn gmail_connection_status() -> serde_json::Value {
-    serde_json::json!({
-        "connected": gmail_oauth::is_connected(),
-        "configured": gmail_config::is_configured(),
-    })
-}
-
-// Fetch new mail from Gmail via the worker. JS passes the last known
-// history_id (or null for initial fetch) and the worker returns metadata for
-// each new message plus the new history cursor. Rust reads the refresh_token
-// from Keychain so it never crosses the IPC boundary.
-#[tauri::command]
-async fn gmail_sync(since_history_id: Option<String>) -> serde_json::Value {
-    let refresh_token = match keyring::Entry::new(gmail_config::KEYCHAIN_SERVICE, gmail_config::KEYCHAIN_ACCOUNT_REFRESH)
-        .and_then(|e| e.get_password())
-    {
-        Ok(t) => t,
-        Err(_) => return serde_json::json!({ "error": "not_connected" }),
-    };
-
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(45))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return serde_json::json!({ "error": "http_client_build_failed", "detail": e.to_string() }),
-    };
-
-    let mut body = serde_json::json!({ "refresh_token": refresh_token });
-    if let Some(hid) = since_history_id {
-        body["since_history_id"] = serde_json::Value::String(hid);
-    }
-
-    match client
-        .post(format!("{}/gmail/sync", LATER_API_BASE))
-        .header("X-Later-Auth", LATER_API_KEY)
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(res) => {
-            let status = res.status();
-            match res.json::<serde_json::Value>().await {
-                Ok(j) => {
-                    if !status.is_success() {
-                        return serde_json::json!({ "error": "worker_error", "status": status.as_u16(), "detail": j });
-                    }
-                    j
-                }
-                Err(e) => serde_json::json!({ "error": "parse_failed", "detail": e.to_string() }),
-            }
-        }
-        Err(e) => serde_json::json!({ "error": "request_failed", "detail": e.to_string() }),
-    }
-}
-
-// Run LLM extraction on a batch of synced messages. JS passes the messages
-// verbatim from gmail_sync's output plus optional user_profile context.
-// Worker handles the Anthropic call and returns per-index verdicts.
-#[tauri::command]
-async fn extract_openloops(
-    messages: serde_json::Value,
-    user_profile: Option<String>,
-    user_email: Option<String>,
-) -> serde_json::Value {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return serde_json::json!({ "error": "http_client_build_failed", "detail": e.to_string() }),
-    };
-
-    let now_iso = chrono_like_now_iso();
-
-    let body = serde_json::json!({
-        "messages": messages,
-        "user_profile": user_profile.unwrap_or_default(),
-        "user_email": user_email.unwrap_or_default(),
-        "now_iso": now_iso,
-    });
-
-    match client
-        .post(format!("{}/extract_openloop", LATER_API_BASE))
-        .header("X-Later-Auth", LATER_API_KEY)
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(res) => {
-            let status = res.status();
-            match res.json::<serde_json::Value>().await {
-                Ok(j) => {
-                    if !status.is_success() {
-                        return serde_json::json!({ "error": "worker_error", "status": status.as_u16(), "detail": j });
-                    }
-                    j
-                }
-                Err(e) => serde_json::json!({ "error": "parse_failed", "detail": e.to_string() }),
-            }
-        }
-        Err(e) => serde_json::json!({ "error": "request_failed", "detail": e.to_string() }),
-    }
-}
-
-// Minimal ISO 8601 UTC formatter — same "don't pull chrono" stance as the
-// reminder parser. Only used to stamp the extraction prompt's "current time"
-// hint, so precision to the second is plenty.
-fn chrono_like_now_iso() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    // days-from-civil-inverse (Hinnant), then h/m/s from remainder.
-    let z = secs.div_euclid(86400) + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    let rem = secs.rem_euclid(86400);
-    let hh = (rem / 3600) as u32;
-    let mm = ((rem % 3600) / 60) as u32;
-    let ss = (rem % 60) as u32;
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hh, mm, ss)
-}
-
 // Parse ISO 8601 into UNIX seconds. Used to compare/sort remind_at values
 // across timezones — the queue picks the smallest (earliest = most overdue).
 fn parse_iso_to_unix(iso: &str) -> Option<i64> {
@@ -921,7 +780,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
-        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, reclassify_item, generate_title, open_library, hide_spotlight, submit_email, finalize_first_launch, schedule_reminder, cancel_reminder, close_reminder_window, open_item_from_reminder, connect_gmail, disconnect_gmail, gmail_connection_status, gmail_sync, extract_openloops])
+        .invoke_handler(tauri::generate_handler![fetch_title, classify_item, reclassify_item, generate_title, generate_starter_categories, log_dev_cache_hit, open_library, hide_spotlight, submit_email, finalize_first_launch, schedule_reminder, cancel_reminder, close_reminder_window, open_item_from_reminder])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -1078,8 +937,10 @@ pub fn run() {
             let marker_present = first_launch_marker_path(&app.handle())
                 .map(|p| p.exists())
                 .unwrap_or(true);
-            if !marker_present {
-                eprintln!("[later] first-launch marker missing — will auto-open library");
+            let replay_onboarding = cfg!(debug_assertions)
+                && std::env::var("VITE_FORCE_ONBOARDING").as_deref() == Ok("1");
+            if !marker_present || replay_onboarding {
+                eprintln!("[later] onboarding launch — will auto-open library");
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(500));

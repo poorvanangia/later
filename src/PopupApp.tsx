@@ -200,6 +200,7 @@ export function PopupApp() {
       setCategories(loadCategories())
     }
     window.addEventListener('storage', reload)
+    window.addEventListener('later:categories-updated', reload)
     let unlisten: (() => void) | undefined
     ;(async () => {
       try {
@@ -209,6 +210,7 @@ export function PopupApp() {
     })()
     return () => {
       window.removeEventListener('storage', reload)
+      window.removeEventListener('later:categories-updated', reload)
       if (unlisten) unlisten()
     }
   }, [])
